@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 import tyro
+import torch
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
@@ -23,6 +24,19 @@ from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.eval.benchmark import load_policy_from_checkpoint
 from supermimic.policy.integral import IntegralPolicyRunner
+
+
+class _ViewerPolicyAdapter:
+    """Convert the viewer's integer done flags before resetting the runner."""
+
+    def __init__(self, runner: IntegralPolicyRunner) -> None:
+        self.runner = runner
+
+    def __call__(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        return self.runner(obs)
+
+    def reset(self, dones: torch.Tensor | None = None) -> None:
+        self.runner.reset(None if dones is None else dones.bool())
 
 
 def main(
@@ -67,14 +81,15 @@ def main(
         return result
 
     env.reset = reset_with_integral
+    viewer_policy = _ViewerPolicyAdapter(pol)
     if viewer == "auto":
         viewer = "native" if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) else "viser"
     print(f"[INFO] {len(files)} clip(s), {num_envs} env(s), viewer={viewer}")
     try:
         if viewer == "native":
-            NativeMujocoViewer(env, pol).run()
+            NativeMujocoViewer(env, viewer_policy).run()
         else:
-            ViserPlayViewer(env, pol).run()
+            ViserPlayViewer(env, viewer_policy).run()
     finally:
         env.close()
 

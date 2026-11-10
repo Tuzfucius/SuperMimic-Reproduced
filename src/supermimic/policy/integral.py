@@ -77,7 +77,7 @@ class IntegralPolicyRunner:
 
     @torch.no_grad()
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
-        """Apply the configured episode-boundary semantics to selected environments."""
+        """Reset selected environments, accepting IDs or a per-environment bool mask."""
         if self.state is None:
             return
         # With carry-over enabled, keep both the accumulated state and its pending
@@ -86,18 +86,27 @@ class IntegralPolicyRunner:
         if not self.options.get("reset_on_episode", True):
             return
         if env_ids is None:
-            ids = torch.arange(self.state.shape[0], device=self.state.device)
+            selector = torch.arange(self.state.shape[0], device=self.state.device)
         else:
-            ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.state.device).reshape(-1)
-        self.state[ids] = 0
+            selector = torch.as_tensor(env_ids, device=self.state.device)
+            if selector.dtype == torch.bool:
+                selector = selector.reshape(-1)
+                if selector.numel() != self.state.shape[0]:
+                    raise ValueError(
+                        "Boolean reset mask must contain one value per environment; "
+                        f"got {selector.numel()} values for {self.state.shape[0]} environments"
+                    )
+            else:
+                selector = selector.to(dtype=torch.long).reshape(-1)
+        self.state[selector] = 0
         if self.previous_error is not None:
-            self.previous_error[ids] = 0
+            self.previous_error[selector] = 0
         if self.previous_frame is not None:
-            self.previous_frame[ids] = 0
+            self.previous_frame[selector] = 0
         if self.previous_clip is not None:
-            self.previous_clip[ids] = 0
+            self.previous_clip[selector] = 0
         if self.has_previous is not None:
-            self.has_previous[ids] = False
+            self.has_previous[selector] = False
 
     @torch.no_grad()
     def __call__(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
