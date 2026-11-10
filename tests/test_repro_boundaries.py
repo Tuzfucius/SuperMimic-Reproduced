@@ -348,9 +348,9 @@ def test_resolve_config_checks_history_and_world_model_replay_capacity():
     resolve_config(minimum)
 
     for history, window, capacity, limiting_name in (
-        (8, 7, 9, "policy.history"),
-        (5, 8, 9, "wm_trainer.window"),
-        (5, 7, 8, "env.replay_capacity"),
+        (8, 7, 10, "policy.history"),
+        (5, 8, 8, "wm_trainer.window"),
+        (5, 7, 7, "env.replay_capacity"),
     ):
         cfg = TrainConfig()
         cfg.policy.history = history
@@ -365,5 +365,5 @@ def test_minimum_valid_replay_capacity_tracks_larger_window(history, window):
     cfg = TrainConfig()
     cfg.policy.history = history
     cfg.wm_trainer.window = window
-    cfg.env.replay_capacity = max(history, window) + 2
+    cfg.env.replay_capacity = max(history + 3, window + 1)
     resolve_config(cfg)

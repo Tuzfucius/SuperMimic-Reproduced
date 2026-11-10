@@ -93,6 +93,11 @@ class ReplayBuffer:
     def size(self) -> int:
         return int(self.valid.sum().item())
 
+    @torch.no_grad()
+    def has_sampleable_windows(self, k: int) -> bool:
+        """Whether current replay contents include at least one legal k-step window."""
+        return bool(self.window_mask(k).any().item())
+
     # ------------------------------------------------------------------ sampling helpers
 
     def _rolled(self, x: torch.Tensor, j: int) -> torch.Tensor:
@@ -118,17 +123,22 @@ class ReplayBuffer:
         return ok
 
     @torch.no_grad()
-    def _sample_from_mask(self, mask: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sample_from_mask(
+        self, mask: torch.Tensor, n: int, sample_kind: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         flat = mask.reshape(-1)
         total = int(flat.sum().item())
         if total == 0:
-            raise RuntimeError("replay buffer has no sampleable rows yet")
+            raise RuntimeError(
+                f"ReplayBuffer has no sampleable {sample_kind}; collect more data and check "
+                "warmup, Episode lengths, and replay capacity"
+            )
         idx = torch.multinomial(flat.float(), n, replacement=True)
         return idx // self.T, idx % self.T
 
     @torch.no_grad()
     def sample_windows(self, n: int, k: int) -> WindowBatch:
-        e, t = self._sample_from_mask(self.window_mask(k), n)
+        e, t = self._sample_from_mask(self.window_mask(k), n, f"{k}-step windows")
         offs = torch.arange(k + 1, device=self.device)
         tt = (t[None, :] + offs[:, None]) % self.T  # (k+1, n)
         ee = e[None, :].expand(k + 1, n)
@@ -148,7 +158,7 @@ class ReplayBuffer:
         t_idx = torch.arange(self.T, device=self.device)[None, :]
         dist_to_ptr = (self.ptr[:, None] - t_idx - 1) % self.T
         mask &= dist_to_ptr < self.T - hist - 1  # keep history rows from being overwritten underneath
-        e, t = self._sample_from_mask(mask, n)
+        e, t = self._sample_from_mask(mask, n, f"starts with history={hist}")
         offs = torch.arange(hist, device=self.device) - (hist - 1)  # -(hist-1) .. 0
         tt = (t[None, :] + offs[:, None]) % self.T  # (hist, n)
         ee = e[None, :].expand(hist, n)

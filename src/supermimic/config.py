@@ -117,14 +117,19 @@ def resolve_config(cfg: TrainConfig) -> TrainConfig:
     cfg.policy.goal_dim = cfg.env.future_frames * 68 + (9 if cfg.env.anchor_obs else 0)
     if cfg.wm_trainer.window < 1:
         raise ValueError("wm_trainer.window must be >= 1")
-    if cfg.env.replay_capacity <= cfg.policy.history + 1:
+    # With a terminal row at the write pointer, sample_starts excludes that row
+    # and retains rows with dist_to_ptr < T - H - 1. T >= H + 3 is therefore
+    # needed to leave one legal nonterminal start after the terminal row.
+    if cfg.env.replay_capacity < cfg.policy.history + 3:
         raise ValueError(
-            "env.replay_capacity must be greater than policy.history + 1 "
+            "env.replay_capacity must be at least policy.history + 3 "
+            "to retain a sampleable start after a terminal row "
             f"(got {cfg.env.replay_capacity} and policy.history={cfg.policy.history})"
         )
-    if cfg.env.replay_capacity <= cfg.wm_trainer.window + 1:
+    # A k-step window needs k transition rows plus its target state row.
+    if cfg.env.replay_capacity < cfg.wm_trainer.window + 1:
         raise ValueError(
-            "env.replay_capacity must be greater than wm_trainer.window + 1 "
+            "env.replay_capacity must be at least wm_trainer.window + 1 "
             f"(got {cfg.env.replay_capacity} and wm_trainer.window={cfg.wm_trainer.window})"
         )
     integral = cfg.integral

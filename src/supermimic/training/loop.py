@@ -228,6 +228,22 @@ class Trainer:
         integral = self.integral_tracker.state if self.integral_tracker is not None and self.cfg.integral.actor_input else None
         return self.policy(obs["policy"], obs["goal"], integral=integral)
 
+    def _log_online_error(self, iteration: int) -> torch.Tensor | None:
+        """Log a replay-backed diagnostic without imposing a fixed WM window."""
+        diagnostic_k = min(8, self.cfg.wm_trainer.window)
+        if not self.buffer.has_sampleable_windows(diagnostic_k):
+            self.writer.add_text(
+                "wm/online_nse_skipped",
+                f"No sampleable {diagnostic_k}-step replay windows; collect longer Episodes or more data.",
+                iteration,
+            )
+            return None
+        error = self.wm_trainer.online_error(self.buffer, n=1024, k=diagnostic_k)
+        self.writer.add_scalar("wm/online_nse_1step", float(error[0]), iteration)
+        if diagnostic_k > 1:
+            self.writer.add_scalar(f"wm/online_nse_{diagnostic_k}step", float(error[-1]), iteration)
+        return error
+
     def run(self) -> None:
         cfg = self.cfg
         sch = cfg.schedule
@@ -336,12 +352,7 @@ class Trainer:
                 else:
                     tr = float("nan")
                 with torch.no_grad():
-                    if self.is_main and self.buffer.size > 2048:
-                        err = self.wm_trainer.online_error(self.buffer, n=1024, k=8)
-                        self.writer.add_scalar("wm/online_nse_1step", float(err[0]), it)
-                        self.writer.add_scalar("wm/online_nse_8step", float(err[-1]), it)
-                    else:
-                        err = None
+                    err = self._log_online_error(it) if self.is_main else None
                 if self.is_main:
                     for k, v in timers.items():
                         self.writer.add_scalar(f"time/{k}_s_per_iter", v / sch.log_interval, it)
@@ -354,10 +365,12 @@ class Trainer:
                             self.writer.add_scalar(f"policy/{key}", value, it)
                     dt_log = time.time() - last_log
                     last_log = time.time()
+                    diagnostic_k = min(8, cfg.wm_trainer.window)
                     msg = (
                         f"it {it} | {elapsed/3600:.2f} h | {sch.log_interval / dt_log:.1f} it/s | updates {self.num_updates} | "
                         f"train_ret {tr:.3f} (n={n_finished}) | "
-                        f"wm nse1 {agg.get('wm/nse_1step', float('nan'))/max(agg_n,1):.4f} nse8 {(float(err[-1]) if err is not None else float('nan')):.4f} | "
+                        f"wm nse1 {agg.get('wm/nse_1step', float('nan'))/max(agg_n,1):.4f} "
+                        f"nse{diagnostic_k} {(float(err[-1]) if err is not None else float('nan')):.4f} | "
                         f"imag_ret {agg.get('policy/imag_return_undisc', float('nan'))/max(agg_n,1):.3f} surv {agg.get('policy/imag_survival_H', float('nan'))/max(agg_n,1):.3f} | "
                         f"t sim/wm/pi {timers['sim']:.1f}/{timers['wm']:.1f}/{timers['policy']:.1f}s"
                     )
