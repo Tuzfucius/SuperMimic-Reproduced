@@ -11,7 +11,13 @@ from supermimic.scripts.sweep import _eval_summary, expand, main
 
 def _write_sweep(tmp_path, *, evaluation=None, tau=2.0):
     train_cfg = tmp_path / "integral.yaml"
-    train_cfg.write_text(f"integral:\n  enabled: true\n  tau_s: {tau}\n")
+    dataset = tmp_path / "motions"
+    dataset.mkdir(exist_ok=True)
+    (dataset / "clip.npz").write_bytes(b"motion")
+    train_cfg.write_text(yaml.safe_dump({
+        "integral": {"enabled": True, "tau_s": tau},
+        "data": {"npz_dir": str(dataset)},
+    }))
     cfg_path = tmp_path / "sweep.yaml"
     cfg_path.write_text(yaml.safe_dump({
         "name": "eval", "output_root": str(tmp_path / "runs"), "seeds": [0],

@@ -77,15 +77,19 @@ class IntegralPolicyRunner:
 
     @torch.no_grad()
     def reset(self, env_ids: torch.Tensor | None = None) -> None:
-        """Forget integral history for all or selected environments after a real reset."""
+        """Apply the configured episode-boundary semantics to selected environments."""
         if self.state is None:
+            return
+        # With carry-over enabled, keep both the accumulated state and its pending
+        # one-step error. The next policy call commits that error exactly once,
+        # matching the Trainer update performed after env.step returns.
+        if not self.options.get("reset_on_episode", True):
             return
         if env_ids is None:
             ids = torch.arange(self.state.shape[0], device=self.state.device)
         else:
             ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.state.device).reshape(-1)
-        if self.options.get("reset_on_episode", True):
-            self.state[ids] = 0
+        self.state[ids] = 0
         if self.previous_error is not None:
             self.previous_error[ids] = 0
         if self.previous_frame is not None:

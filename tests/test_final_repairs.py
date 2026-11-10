@@ -251,14 +251,21 @@ def test_training_and_evaluation_identities_track_config_dataset_and_checkpoint(
     monkeypatch.setattr(sweep, "git_info", lambda: {"commit": "abc123", "dirty": False, "status": "clean"})
     base = tmp_path / "base.yaml"
     child = tmp_path / "child.yaml"
-    base.write_text("integral:\n  tau_s: 2.0\n")
+    train_data = tmp_path / "train_data"
+    train_data.mkdir()
+    (train_data / "clip.npz").write_bytes(b"motion")
+    base.write_text(yaml.safe_dump({
+        "integral": {"tau_s": 2.0}, "data": {"npz_dir": str(train_data)},
+    }))
     child.write_text("_base_: base.yaml\n")
     row = expand({"experiments": [{"id": "I1", "cfg": "child.yaml", "seeds": [0]}]}, child)[0]
     _, hash_a = sweep._train_identity(row, tmp_path / "runs")
     _, hash_same = sweep._train_identity(row, tmp_path / "runs")
     assert hash_a == hash_same
 
-    base.write_text("integral:\n  tau_s: 5.0\n")
+    base.write_text(yaml.safe_dump({
+        "integral": {"tau_s": 5.0}, "data": {"npz_dir": str(train_data)},
+    }))
     _, hash_inherited = sweep._train_identity(row, tmp_path / "runs")
     assert hash_inherited != hash_a
     row_override = {**row, "set": [*row["set"], "integral.tau_s=5.0"]}
@@ -283,7 +290,7 @@ def test_training_and_evaluation_identities_track_config_dataset_and_checkpoint(
     clip = dataset / "clip.npz"
     clip.write_bytes(b"first")
     fingerprint = sweep._dataset_identity(dataset)
-    assert fingerprint["file_count"] == 1 and "files" not in fingerprint and fingerprint["manifest_sha256"]
+    assert fingerprint["file_count"] == 1 and "files" not in fingerprint and fingerprint["files_digest"]
     checkpoint = tmp_path / "ckpt.pt"
     checkpoint.write_bytes(b"weights-a")
     eval_cfg = {"dataset": str(dataset), "num_envs": 2}
@@ -309,7 +316,10 @@ def test_existing_sweep_run_reuse_requires_exact_training_identity(tmp_path, mon
     monkeypatch.setattr(sweep, "git_info", lambda: {"commit": "abc123", "dirty": False, "status": "clean"})
     output = tmp_path / "runs"
     config = tmp_path / "train.yaml"
-    config.write_text("integral:\n  tau_s: 2.0\n")
+    train_data = tmp_path / "train_data"
+    train_data.mkdir()
+    (train_data / "clip.npz").write_bytes(b"motion")
+    config.write_text(yaml.safe_dump({"integral": {"tau_s": 2.0}, "data": {"npz_dir": str(train_data)}}))
     cfg_path = tmp_path / "sweep.yaml"
     cfg_path.write_text(yaml.safe_dump({
         "name": "identity", "output_root": str(output),
@@ -335,7 +345,7 @@ def test_existing_sweep_run_reuse_requires_exact_training_identity(tmp_path, mon
     sweep.main()
     assert len(calls) == 1
 
-    config.write_text("integral:\n  tau_s: 5.0\n")
+    config.write_text(yaml.safe_dump({"integral": {"tau_s": 5.0}, "data": {"npz_dir": str(train_data)}}))
     monkeypatch.setattr(sys, "argv", ["sm-sweep", "--cfg", str(cfg_path)])
     with pytest.raises(ValueError, match="training identity mismatch"):
         sweep.main()
@@ -348,7 +358,10 @@ def test_unverified_and_corrupt_sweep_metadata_are_never_reused(tmp_path, monkey
     monkeypatch.setattr(sweep, "git_info", lambda: {"commit": "abc123", "dirty": False, "status": "clean"})
     output = tmp_path / "runs"
     cfg_file = tmp_path / "train.yaml"
-    cfg_file.write_text("seed: 0\n")
+    train_data = tmp_path / "train_data"
+    train_data.mkdir()
+    (train_data / "clip.npz").write_bytes(b"motion")
+    cfg_file.write_text(yaml.safe_dump({"seed": 0, "data": {"npz_dir": str(train_data)}}))
     cfg_path = tmp_path / "sweep.yaml"
     cfg_path.write_text(yaml.safe_dump({
         "name": "legacy", "output_root": str(output),

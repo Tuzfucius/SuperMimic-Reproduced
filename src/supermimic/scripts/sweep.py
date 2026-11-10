@@ -23,6 +23,7 @@ from supermimic.config_loader import config_dict, load_config
 from supermimic.experiment import git_info
 
 EVALUATION_PROTOCOL_VERSION = 1
+DATASET_FINGERPRINT_METHOD = "sha256-content-v1"
 
 
 def _canonical(value: Any) -> str:
@@ -33,27 +34,50 @@ def _hash(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode()).hexdigest()
 
 
-def _dataset_identity(value: str | Path | None) -> dict:
+def _file_sha256(path: Path, file_sha256_cache: dict[str, str] | None = None) -> str:
+    path = path.expanduser().resolve()
+    key = str(path)
+    if file_sha256_cache is not None and key in file_sha256_cache:
+        return file_sha256_cache[key]
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    value = digest.hexdigest()
+    if file_sha256_cache is not None:
+        file_sha256_cache[key] = value
+    return value
+
+
+def _dataset_identity(value: str | Path | None, file_sha256_cache: dict[str, str] | None = None) -> dict:
     if value is None:
-        return {"path": None, "file_count": 0, "manifest_sha256": _hash([])}
+        return {"root": None, "file_count": 0, "files_digest": _hash([]), "fingerprint_method": DATASET_FINGERPRINT_METHOD}
     path = Path(value).expanduser().resolve()
     if path.is_file():
         files = [path]
     elif path.is_dir():
-        files = sorted(path.rglob("*.npz"))
+        files = sorted(p for p in path.rglob("*.npz") if p.is_file())
         if not files:
             files = sorted(p for p in path.rglob("*") if p.is_file())
     else:
-        return {"path": str(path), "missing": True, "file_count": 0, "manifest_sha256": _hash([])}
+        raise FileNotFoundError(f"dataset input does not exist: {path}")
+    if not files:
+        raise ValueError(f"dataset input contains no files: {path}")
+    root = path if path.is_dir() else path.parent
     entries = []
     for file in files:
         stat = file.stat()
         entries.append({
-            "path": str(file.relative_to(path)) if path.is_dir() else file.name,
+            "relative_path": file.relative_to(root).as_posix(),
             "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
+            "content_sha256": _file_sha256(file, file_sha256_cache),
         })
-    return {"path": str(path), "file_count": len(entries), "manifest_sha256": _hash(entries)}
+    return {
+        "root": str(root),
+        "file_count": len(entries),
+        "files_digest": _hash(entries),
+        "fingerprint_method": DATASET_FINGERPRINT_METHOD,
+    }
 
 
 def _clean_git_identity() -> dict:
@@ -61,21 +85,49 @@ def _clean_git_identity() -> dict:
     return {"commit": info.get("commit"), "dirty": bool(info.get("dirty")), "status": info.get("status", "unknown")}
 
 
-def _train_identity(row: dict, output_root: Path) -> tuple[dict, str]:
+def _load_sweep_config(row: dict, output_root: Path):
     overrides = [f"run_name={row['name']}", f"log_root={output_root}", *row["set"]]
     cfg = load_config(row["cfg"], overrides)
+    if cfg.resume is not None:
+        raise ValueError("sm-sweep does not support resume; use sm-train to resume an experiment")
+    if cfg.init_from is not None and not cfg.init_from.expanduser().is_file():
+        raise FileNotFoundError(f"init_from checkpoint does not exist: {cfg.init_from.expanduser().resolve()}")
+    return cfg
+
+
+def _checkpoint_identity(path: Path, file_sha256_cache: dict[str, str] | None = None) -> dict:
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint does not exist: {path}")
+    return {"path": str(path), "size": path.stat().st_size, "sha256": _file_sha256(path, file_sha256_cache)}
+
+
+def _train_identity(
+    row: dict,
+    output_root: Path,
+    file_sha256_cache: dict[str, str] | None = None,
+) -> tuple[dict, str]:
+    cfg = _load_sweep_config(row, output_root)
     resolved = config_dict(cfg)
     # Run placement and display name do not change the computation being trained.
     resolved.pop("run_name", None)
     resolved.pop("log_root", None)
-    resolved.pop("resume", None)
     resolved.pop("init_from", None)
     data = resolved.get("data", {})
-    dataset = {
-        "npz_dir": _dataset_identity(data.get("npz_dir")),
-        "library": _dataset_identity(data.get("library")) if data.get("library") else None,
-        "manifest": _dataset_identity(data.get("manifest")) if data.get("manifest") else None,
-    }
+    if data.get("library"):
+        dataset = {"library": _dataset_identity(data["library"], file_sha256_cache)}
+    else:
+        dataset = {"npz_dir": _dataset_identity(data.get("npz_dir"), file_sha256_cache)}
+    if data.get("manifest"):
+        dataset["manifest"] = _dataset_identity(data["manifest"], file_sha256_cache)
+    initialization = {"mode": "scratch"}
+    if cfg.init_from is not None:
+        checkpoint = _checkpoint_identity(cfg.init_from, file_sha256_cache)
+        initialization = {
+            "mode": "init_from",
+            "checkpoint_path": checkpoint["path"],
+            "checkpoint_sha256": checkpoint["sha256"],
+        }
     identity = {
         "experiment_id": row["id"],
         "variant_id": row["variant_id"],
@@ -83,25 +135,21 @@ def _train_identity(row: dict, output_root: Path) -> tuple[dict, str]:
         "seed": row["seed"],
         "config": resolved,
         "dataset": dataset,
+        "initialization": initialization,
         "code": _clean_git_identity(),
     }
     return identity, _hash(identity)
 
 
-def _checkpoint_identity(path: Path) -> dict:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for block in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(block)
-    stat = path.stat()
-    return {"path": str(path.resolve()), "size": stat.st_size, "sha256": digest.hexdigest()}
-
-
-def _evaluation_identity(checkpoint: Path, eval_cfg: dict) -> tuple[dict, str]:
-    dataset = _dataset_identity(eval_cfg.get("dataset"))
+def _evaluation_identity(
+    checkpoint: Path,
+    eval_cfg: dict,
+    file_sha256_cache: dict[str, str] | None = None,
+) -> tuple[dict, str]:
+    dataset = _dataset_identity(eval_cfg.get("dataset"), file_sha256_cache)
     params = {key: value for key, value in eval_cfg.items() if key not in {"enabled", "dataset", "checkpoint"}}
     auxiliary_inputs = {
-        key: _dataset_identity(eval_cfg[key])
+        key: _dataset_identity(eval_cfg[key], file_sha256_cache)
         for key in ("manifest", "clip_list")
         if eval_cfg.get(key)
     }
@@ -111,7 +159,7 @@ def _evaluation_identity(checkpoint: Path, eval_cfg: dict) -> tuple[dict, str]:
         "auxiliary_inputs": auxiliary_inputs,
         "parameters": params,
         "checkpoint_selector": eval_cfg.get("checkpoint", "latest"),
-        "checkpoint": _checkpoint_identity(checkpoint),
+        "checkpoint": _checkpoint_identity(checkpoint, file_sha256_cache),
         "code": _clean_git_identity(),
     }
     return identity, _hash(identity)
@@ -299,6 +347,10 @@ def main() -> None:
     root = (root / group).resolve()
     eval_cfg = spec.get("evaluation", {}) or {}
     eval_enabled = bool(eval_cfg.get("enabled", False))
+    # Resolve all row configs before running or printing the matrix so Resume and
+    # missing initialization checkpoints cannot be silently accepted by Sweep.
+    for row in rows:
+        _load_sweep_config(row, root)
     allowed_eval_keys = {"enabled", "dataset", "num_envs", "device", "checkpoint", "clips", "clip_list", "manifest"}
     unknown_eval_keys = set(eval_cfg) - allowed_eval_keys
     if unknown_eval_keys:
@@ -323,10 +375,13 @@ def main() -> None:
 
     root.mkdir(parents=True, exist_ok=True)
     results = []
+    # A single in-memory cache avoids rereading the same large motion files for
+    # every seed/variant during this Sweep invocation. It is never persisted.
+    file_sha256_cache: dict[str, str] = {}
     for row in rows:
         run_dir = root / row["name"]
         meta_path = run_dir / "metadata.json"
-        requested_identity, requested_hash = _train_identity(row, root)
+        requested_identity, requested_hash = _train_identity(row, root, file_sha256_cache)
         metadata: dict = {}
         should_train = True
         if meta_path.exists():
@@ -363,7 +418,7 @@ def main() -> None:
                     "training_identity_sha256": requested_hash,
                 })
                 continue
-            eval_identity, eval_hash = _evaluation_identity(checkpoint, eval_cfg)
+            eval_identity, eval_hash = _evaluation_identity(checkpoint, eval_cfg, file_sha256_cache)
             result_files_exist = (run_dir / "eval_metrics.json").is_file() and (run_dir / "benchmark.json").is_file()
             eval_done = (
                 metadata.get("evaluation_state") == "completed"
@@ -439,7 +494,7 @@ def main() -> None:
         if eval_enabled:
             try:
                 checkpoint = _select_checkpoint(run_dir, metadata, eval_cfg)
-                eval_identity, eval_hash = _evaluation_identity(checkpoint, eval_cfg)
+                eval_identity, eval_hash = _evaluation_identity(checkpoint, eval_cfg, file_sha256_cache)
             except OSError as exc:
                 metrics, eval_error, eval_hash, eval_identity = None, str(exc), None, None
             else:

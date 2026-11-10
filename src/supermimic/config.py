@@ -115,6 +115,18 @@ def resolve_config(cfg: TrainConfig) -> TrainConfig:
     cfg.policy_trainer.history = cfg.policy.history
     cfg.policy_trainer.future_frames = cfg.env.future_frames
     cfg.policy.goal_dim = cfg.env.future_frames * 68 + (9 if cfg.env.anchor_obs else 0)
+    if cfg.wm_trainer.window < 1:
+        raise ValueError("wm_trainer.window must be >= 1")
+    if cfg.env.replay_capacity <= cfg.policy.history + 1:
+        raise ValueError(
+            "env.replay_capacity must be greater than policy.history + 1 "
+            f"(got {cfg.env.replay_capacity} and policy.history={cfg.policy.history})"
+        )
+    if cfg.env.replay_capacity <= cfg.wm_trainer.window + 1:
+        raise ValueError(
+            "env.replay_capacity must be greater than wm_trainer.window + 1 "
+            f"(got {cfg.env.replay_capacity} and wm_trainer.window={cfg.wm_trainer.window})"
+        )
     integral = cfg.integral
     if integral.error_source != "joint_pos":
         raise ValueError("integral.error_source currently supports only 'joint_pos'")
