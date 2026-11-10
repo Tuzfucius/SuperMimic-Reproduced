@@ -134,6 +134,7 @@ The design documents are in Chinese; a full Chinese version of this README follo
 | [docs/REPRODUCTION_PLAN.md](docs/REPRODUCTION_PLAN.md) | Plan: goals, environment, design decisions D1–D20, repo skeleton, phased steps, tests, budget, risks |
 | [docs/REVIEW_LOG.md](docs/REVIEW_LOG.md) | Self-review and two adversarial reviews of the plan |
 | [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) | Experiment log: configuration, curves, evaluation, decisions that deviated from the plan, pitfalls |
+| [docs/CONFIG_AND_INTEGRAL.md](docs/CONFIG_AND_INTEGRAL.md) | YAML configuration, dynamic history, integral state, Sweep identity and aggregation, Resume, and verification limits |
 
 ## Engineering notes
 
@@ -213,6 +214,7 @@ The design documents are in Chinese; a full Chinese version of this README follo
 | [docs/REPRODUCTION_PLAN.md](docs/REPRODUCTION_PLAN.md) | 复现计划：目标、环境、设计决策 D1–D20、repo 骨架、分阶段步骤、测试、预算、风险 |
 | [docs/REVIEW_LOG.md](docs/REVIEW_LOG.md) | 计划的自审与两轮对抗审查记录 |
 | [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) | 实验日志：每个实验的配置、曲线、评测、偏离计划的决定、踩坑记录 |
+| [docs/CONFIG_AND_INTEGRAL.md](docs/CONFIG_AND_INTEGRAL.md) | YAML 配置、动态 history、积分状态、Sweep 身份与汇总、Resume 和验收边界 |
 
 ## 工程备注
 
