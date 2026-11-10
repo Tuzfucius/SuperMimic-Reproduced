@@ -76,6 +76,7 @@ class PolicyTrainer:
             integral_clip_abs=ic.clip_abs if ic else 0.5,
             integral_gradient_mode=ic.gradient_mode if ic else "full",
             integral_actor_input=bool(ic and ic.actor_input),
+            integral_residual_enabled=bool(ic and ic.residual_enabled),
         )
         feat, goals, e_root = self._critic_inputs(ro)
         if cfg.use_critic:
@@ -105,11 +106,20 @@ class PolicyTrainer:
         if ro.integrals is not None:
             iz = ro.integrals.detach()
             metrics.update({
-                "integral_mean": float(iz.mean()),
-                "integral_abs_mean": float(iz.abs().mean()),
-                "integral_norm": float(iz.norm(dim=-1).mean()),
-                "integral_clip_fraction": float((iz.abs() >= (ic.clip_abs if ic else 0.5)).float().mean()),
-                "joint_tracking_error": float(ro.joint_errors.abs().mean()),
+                "imag/integral_mean": float(iz.mean()),
+                "imag/integral_abs_mean": float(iz.abs().mean()),
+                "imag/integral_norm": float(iz.norm(dim=-1).mean()),
+                "imag/integral_clip_fraction": float((iz.abs() >= (ic.clip_abs if ic else 0.5)).float().mean()),
+                "imag/joint_tracking_error": float(ro.joint_errors.abs().mean()),
+            })
+        if ro.integral_action_metrics is not None:
+            gain = self.integral_cfg.residual_max_gain * torch.tanh(self.policy.integral_gain_raw.detach())
+            metrics.update({
+                "imag/integral_gain_abs_mean": float(gain.abs().mean()),
+                "imag/integral_gain_max_abs": float(gain.abs().max()),
+                "imag/integral_correction_abs_mean": float(ro.integral_action_metrics["integral_correction_abs_mean"]),
+                "imag/integral_correction_max_abs": float(ro.integral_action_metrics["integral_correction_max_abs"]),
+                "imag/integral_correction_action_ratio": float(ro.integral_action_metrics["integral_correction_action_ratio"]),
             })
         for k, v in ro.reward_terms.items():
             metrics[f"imag_r/{k}"] = v

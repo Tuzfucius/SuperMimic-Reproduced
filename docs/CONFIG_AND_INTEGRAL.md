@@ -54,6 +54,51 @@ z_(t+1) = clamp(exp(-dt / tau_s) * z_t + dt * e_t, -clip_abs, clip_abs)
 
 这些名称定义实现配置，不代表消融结果或性能结论。基准配置在 `configs/experiments/`，Sweep 清单在 `configs/sweeps/integral_ablation.yaml`。
 
+## I4：显式可学习积分残差
+
+I4 保留同一积分状态递推与 Replay 对齐方式，但不把积分拼入 Actor Decoder。Actor 先按 B0 结构计算原始动作，再逐关节加上受限残差：
+
+```text
+a_base = pi_theta(o, g)
+K_I = residual_max_gain * tanh(integral_gain_raw)
+a = a_base + K_I * z
+```
+
+`integral_gain_raw` 是长度 29 的可训练向量，初始化为全零。因此初始 `K_I=0`，即使 `z` 非零，I4 仍逐元素复现 B0 动作。`residual_max_gain` 默认 0.4；与默认积分限幅 0.5 配合时，每个关节的残差绝对值不超过 0.2。正负增益均可学习。残差施加在归一化 Actor 动作上，并继续经过现有环境动作接口。
+
+I1 将积分拼入 Decoder 输入；I4 保持 B0 的 Decoder 和 Critic 输入维度，只增加 Actor 的 29 个增益参数。I4 配置将 `actor_input`、`critic_input` 设为 false，但真实采样、想象和评估仍把 `z_t` 交给策略的残差分支。每步动作使用 `z_t`，误差随后更新成 `z_(t+1)`；Episode Reset、Full/Detach 递推和 Replay 格式沿用既有实现。
+
+独立配置为 `configs/experiments/integral_residual.yaml`，默认 history=10 时 Decoder 输入仍为 `32 + 930 = 962`，Critic 不增加积分输入。Dry Run 会单独显示残差是否开启、最大增益和增益参数数量：
+
+```bash
+env -u PYTHONPATH uv run sm-train --cfg configs/experiments/integral_residual.yaml --dry-run
+```
+
+从正式 B0 Checkpoint 创建 I4 新实验时用 `init_from`，模型权重严格加载，只允许 B0 缺少新增的 `integral_gain_raw`；该参数保持零初始化。优化器和计数器重新开始。相同 B0 Checkpoint 的等预算对照命令示例：
+
+```bash
+B0_CKPT=logs/B0/checkpoints/ckpt_latest.pt
+uv run sm-train --cfg configs/experiments/baseline.yaml \
+  --set run_name=B0_continue --set init_from="$B0_CKPT"
+uv run sm-train --cfg configs/experiments/integral_residual.yaml \
+  --set run_name=I4_warmstart --set init_from="$B0_CKPT"
+```
+
+两组都创建新运行、加载同一模型权重且不恢复历史优化器；请为两边设置相同的总训练步数、Seed、数据和运行预算。`resume` 只用于结构和训练语义相同的同一实验，B0 → I4 不属于可 Resume 的迁移。
+
+评估、交互 Viewer 和视频录制仍使用各自现有入口；它们从 Checkpoint 配置构造含残差参数的 `Policy`，并通过 `IntegralPolicyRunner` 维护 `z_t`：
+
+```bash
+uv run python scripts/eval_benchmark.py --ckpt logs/I4_warmstart/checkpoints/ckpt_latest.pt \
+  --npz-dir data/npz/lafan1 --num-envs 256
+uv run python scripts/play.py --ckpt logs/I4_warmstart/checkpoints/ckpt_latest.pt \
+  --npz-dir data/npz/lafan1 --num-envs 1
+```
+
+真实采样和想象的积分/残差监控使用不同 TensorBoard 路径（`policy/real/*`、`policy/imag/*`），覆盖有效增益、补偿幅度、相对原始动作的补偿比、积分范数、饱和比例和关节误差。补偿比为 mean absolute correction / max(mean absolute base action, 1e-6)。监控只读取 detach 后的统计，不添加训练目标。
+
+当前工程验收测试用于验证零初始化动作一致、增益梯度、逐关节作用、限幅、严格 Checkpoint 迁移、Runner 和想象动作路径。它们不证明 I4 的运动效果或研究收益；这些仍需后续正式训练和 benchmark。
+
 ## Sweep、身份与汇总
 
 Grid 的每个参数组合先规范化为按键排序的 JSON，再以 SHA-256 前 12 位生成稳定 `variant_id`。组合顺序变化不改变 ID；每次运行名包含实验 ID、variant ID 和 Seed，完整 `params` 也保存在行结果及汇总中。

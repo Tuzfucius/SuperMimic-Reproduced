@@ -69,6 +69,11 @@ def main() -> None:
                 "actor_decoder_input": cfg.policy.latent_dim + cfg.policy.history * 93 + cfg.policy.integral_dim,
                 "critic_integral": cfg.critic.integral_dim,
             },
+            "integral_residual": {
+                "enabled": cfg.integral.residual_enabled,
+                "max_gain": cfg.integral.residual_max_gain,
+                "learnable_parameters": 29 if cfg.integral.residual_enabled else 0,
+            },
             "experiment_path": str(cfg.log_root / cfg.run_name),
             "validation": "configuration structure only; no GPU or simulator initialized",
         }, indent=2))

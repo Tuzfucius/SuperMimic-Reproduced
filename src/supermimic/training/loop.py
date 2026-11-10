@@ -24,6 +24,7 @@ from supermimic.experiment import (
 )
 from supermimic.imagination.policy_trainer import PolicyTrainer
 from supermimic.kinematics.g1_fk import G1Kinematics
+from supermimic.policy.checkpoint import is_b0_to_i4_init, prepare_state_dict
 from supermimic.policy.integral import IntegralStateTracker
 from supermimic.policy.nets import Critic, Policy
 from supermimic.training.distributed import (
@@ -132,6 +133,9 @@ class Trainer:
         self.wm = WorldModel(cfg.world_model, heads, self.device)
         self.policy = Policy(cfg.policy).to(self.device)
         self.critic = Critic(cfg.critic, pcfg=cfg.policy).to(self.device)
+        self._real_action_abs_sums = torch.zeros(2, device=self.device)
+        self._real_action_abs_max = torch.zeros(2, device=self.device)
+        self._real_action_count = 0
         for m in (self.wm, self.policy, self.critic):
             broadcast_params(m)
         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
@@ -196,13 +200,32 @@ class Trainer:
 
     def load(self, path: Path, resume: bool = True) -> None:
         ck = torch.load(path, map_location=self.device, weights_only=False)
+        source_integral = ck.get("config", {}).get("integral", {})
+        target_residual_enabled = getattr(
+            getattr(getattr(self, "cfg", None), "integral", None),
+            "residual_enabled",
+            False,
+        )
+        b0_to_i4_init = is_b0_to_i4_init(
+            source_integral,
+            resume=resume,
+            target_residual_enabled=target_residual_enabled,
+        )
         try:
-            self.wm.load_state_dict(ck["wm"])
-            self.policy.load_state_dict(ck["policy"])
-            self.critic.load_state_dict(ck["critic"])
-        except RuntimeError as exc:
+            wm_state = prepare_state_dict(self.wm, ck["wm"])
+            policy_state = prepare_state_dict(
+                self.policy,
+                ck["policy"],
+                allowed_missing=("integral_gain_raw",) if b0_to_i4_init else (),
+            )
+            critic_state = prepare_state_dict(self.critic, ck["critic"])
+        except (KeyError, RuntimeError) as exc:
             mode = "resume" if resume else "init_from"
             raise RuntimeError(f"checkpoint {mode} is structurally incompatible with configured model: {exc}") from exc
+        # Validate all three models before mutating any of them; loading remains strict.
+        self.wm.load_state_dict(wm_state, strict=True)
+        self.policy.load_state_dict(policy_state, strict=True)
+        self.critic.load_state_dict(critic_state, strict=True)
         if resume:
             try:
                 self.wm_trainer.opt.load_state_dict(ck["wm_opt"])
@@ -225,8 +248,50 @@ class Trainer:
 
     @torch.no_grad()
     def act(self, obs) -> torch.Tensor:
-        integral = self.integral_tracker.state if self.integral_tracker is not None and self.cfg.integral.actor_input else None
+        ic = self.cfg.integral
+        use_integral = ic.actor_input or ic.residual_enabled
+        integral = self.integral_tracker.state if self.integral_tracker is not None and use_integral else None
+        if ic.residual_enabled:
+            base_action, correction = self.policy.forward_components(
+                obs["policy"], obs["goal"], integral=integral
+            )
+            self._real_action_abs_sums += torch.stack((base_action.abs().sum(), correction.abs().sum()))
+            self._real_action_abs_max = torch.maximum(
+                self._real_action_abs_max,
+                torch.stack((base_action.abs().max(), correction.abs().max())),
+            )
+            self._real_action_count += base_action.numel()
+            return base_action + correction
         return self.policy(obs["policy"], obs["goal"], integral=integral)
+
+    def _log_real_integral_metrics(self, iteration: int) -> None:
+        if self.integral_tracker is not None:
+            for key, value in self.integral_tracker.metrics().items():
+                self.writer.add_scalar(f"policy/real/{key}", value, iteration)
+        if not self.cfg.integral.residual_enabled:
+            return
+        eps = 1e-6
+        count = max(self._real_action_count, 1)
+        gain = self.cfg.integral.residual_max_gain * torch.tanh(self.policy.integral_gain_raw.detach())
+        values = torch.stack((
+            gain.abs().mean(),
+            gain.abs().max(),
+            self._real_action_abs_sums[1] / count,
+            self._real_action_abs_max[1],
+            (self._real_action_abs_sums[1] / count) / (self._real_action_abs_sums[0] / count).clamp_min(eps),
+        )).cpu().tolist()
+        names = (
+            "integral_gain_abs_mean",
+            "integral_gain_max_abs",
+            "integral_correction_abs_mean",
+            "integral_correction_max_abs",
+            "integral_correction_action_ratio",
+        )
+        for name, value in zip(names, values):
+            self.writer.add_scalar(f"policy/real/{name}", value, iteration)
+        self._real_action_abs_sums.zero_()
+        self._real_action_abs_max.zero_()
+        self._real_action_count = 0
 
     def _log_online_error(self, iteration: int) -> torch.Tensor | None:
         """Log a replay-backed diagnostic without imposing a fixed WM window."""
@@ -360,9 +425,7 @@ class Trainer:
                     self.writer.add_scalar("time/updates", self.num_updates, it)
                     self.writer.add_scalar("sampler/entropy", float(self.command.metrics["sampling_entropy"][0]), it)
                     self.writer.add_scalar("sampler/bin_return_mean", float(self.command.bin_return.mean()), it)
-                    if self.integral_tracker is not None:
-                        for key, value in self.integral_tracker.metrics().items():
-                            self.writer.add_scalar(f"policy/{key}", value, it)
+                    self._log_real_integral_metrics(it)
                     dt_log = time.time() - last_log
                     last_log = time.time()
                     diagnostic_k = min(8, cfg.wm_trainer.window)
