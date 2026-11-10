@@ -38,6 +38,7 @@ class ImagRollout:
     integrals: torch.Tensor | None  # (H+1, n, 29), z_t aligned with state/action at t
     joint_errors: torch.Tensor | None  # (H+1, n, 29), policy-visible ref-minus-observation error
     reward_terms: dict  # mean of each reward term over the rollout (diagnostics)
+    integral_action_metrics: dict[str, torch.Tensor] | None
 
 
 def imagine(
@@ -57,9 +58,17 @@ def imagine(
     integral_clip_abs: float = 0.5,
     integral_gradient_mode: str = "full",
     integral_actor_input: bool = True,
+    integral_residual_enabled: bool = False,
 ) -> ImagRollout:
     device = start.state.device
     n = start.state.shape[0]
+    policy_has_residual = getattr(policy, "integral_residual_enabled", False)
+    if integral_residual_enabled != policy_has_residual:
+        raise ValueError(
+            "imagination residual configuration must match the policy; "
+            f"got residual_enabled={integral_residual_enabled} for policy="
+            f"{policy_has_residual}"
+        )
     q0 = lib.default_joint_pos
     step_fn = step_fn or ImagStep(wm, q0)
     noise_half = OBS_NOISE_HALF.to(device)
@@ -114,10 +123,28 @@ def imagine(
     goals = [make_goal(frame, ref, anchor_pose)]
     e_roots = [wm.heads.root_error_features(s, ref)]
     term_sum = torch.zeros(len(REWARD_TERM_NAMES), device=device)
+    residual_base_abs_sum = torch.zeros((), device=device)
+    residual_correction_abs_sum = torch.zeros((), device=device)
+    residual_correction_abs_max = torch.zeros((), device=device)
+    integral_action_metrics = None
 
     for t in range(horizon):
         obs_flat = flatten_history_term_major(torch.stack(hist, 0))
-        a = policy(obs_flat, goals[-1], integral=integral if integral_actor_input else None)
+        policy_integral = integral if (integral_actor_input or integral_residual_enabled) else None
+        if integral_residual_enabled:
+            base_action, correction = policy.forward_components(
+                obs_flat, goals[-1], integral=policy_integral
+            )
+            a = base_action + correction
+            # Diagnostic reductions are detached and stay on device until the
+            # policy update emits its interval-level scalar metrics.
+            residual_base_abs_sum += base_action.detach().abs().sum()
+            residual_correction_abs_sum += correction.detach().abs().sum()
+            residual_correction_abs_max = torch.maximum(
+                residual_correction_abs_max, correction.detach().abs().max()
+            )
+        else:
+            a = policy(obs_flat, goals[-1], integral=policy_integral)
         if integral is not None:
             # Match collection: action uses z_t, then the error from the same visible (o_t, g_t)
             # advances memory to z_{t+1}. The newest observation is term-major frame hist[-1].
@@ -146,6 +173,16 @@ def imagine(
         e_roots.append(wm.heads.root_error_features(s, ref))
         frames.append(frame)
 
+    if integral_residual_enabled:
+        action_count = horizon * n * actions[0].shape[-1]
+        base_mean = residual_base_abs_sum / action_count
+        correction_mean = residual_correction_abs_sum / action_count
+        integral_action_metrics = {
+            "integral_correction_abs_mean": correction_mean,
+            "integral_correction_max_abs": residual_correction_abs_max,
+            "integral_correction_action_ratio": correction_mean / base_mean.clamp_min(1e-6),
+        }
+
     return ImagRollout(
         states=torch.stack(states),
         actions=torch.stack(actions),
@@ -158,4 +195,5 @@ def imagine(
         integrals=torch.stack(integrals) if integrals is not None else None,
         joint_errors=torch.stack(joint_errors) if joint_errors is not None else None,
         reward_terms={k: float(v / horizon) for k, v in zip(REWARD_TERM_NAMES, term_sum.tolist())},
+        integral_action_metrics=integral_action_metrics,
     )

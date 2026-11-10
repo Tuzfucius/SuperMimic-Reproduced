@@ -1,0 +1,13 @@
+_base_: baseline.yaml
+run_name: I4
+
+integral:
+  enabled: true
+  actor_input: false
+  critic_input: false
+  residual_enabled: true
+  residual_max_gain: 0.4
+  tau_s: 2.0
+  clip_abs: 0.5
+  gradient_mode: full
+  reset_on_episode: true

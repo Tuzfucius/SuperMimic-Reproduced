@@ -28,6 +28,8 @@ class PolicyCfg:
     decoder_last_gain: float = 0.01
     goal_dim: int = GOAL_DIM  # 680 (+9 with anchor_obs)
     integral_dim: int = 0
+    integral_residual_enabled: bool = False
+    integral_residual_max_gain: float = 0.4
 
 
 @dataclass
@@ -86,9 +88,41 @@ class Policy(nn.Module):
         self.cfg = cfg
         self.encoders = nn.ModuleDict({"motion": MotionEncoder(cfg)})
         self.decoder = Decoder(cfg)
+        self.integral_residual_enabled = cfg.integral_residual_enabled
+        if self.integral_residual_enabled:
+            self.integral_gain_raw = nn.Parameter(torch.zeros(ACT_DIM))
+        else:
+            self.register_parameter("integral_gain_raw", None)
+
+    def forward_components(
+        self,
+        obs_hist: torch.Tensor,
+        goal: torch.Tensor,
+        interface: str = "motion",
+        integral: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Return the unmodified decoder action and its optional integral residual."""
+        base_action = self.decoder(self.encoders[interface](goal), obs_hist, integral)
+        if not self.integral_residual_enabled:
+            return base_action, None
+        if integral is None:
+            raise ValueError("policy integral residual requires an integral input")
+        if integral.shape != base_action.shape:
+            raise ValueError(
+                "policy integral residual input must match the action batch and dimension; "
+                f"got {tuple(integral.shape)} for action {tuple(base_action.shape)}"
+            )
+        if integral.device != base_action.device:
+            raise ValueError(
+                "policy integral residual input and action must be on the same device; "
+                f"got {integral.device} and {base_action.device}"
+            )
+        gain = self.cfg.integral_residual_max_gain * torch.tanh(self.integral_gain_raw)
+        return base_action, gain * integral
 
     def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, interface: str = "motion", integral: torch.Tensor | None = None) -> torch.Tensor:
-        return self.decoder(self.encoders[interface](goal), obs_hist, integral)
+        base_action, correction = self.forward_components(obs_hist, goal, interface, integral)
+        return base_action if correction is None else base_action + correction
 
 
 class Critic(nn.Module):

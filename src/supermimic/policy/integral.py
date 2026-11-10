@@ -153,5 +153,6 @@ class IntegralPolicyRunner:
         self.previous_frame.copy_(frame)
         self.previous_clip.copy_(clip)
         self.has_previous[:] = True
-        integral = self.state if self.options.get("actor_input", True) else None
+        use_integral = self.options.get("actor_input", True) or self.options.get("residual_enabled", False)
+        integral = self.state if use_integral else None
         return self.policy(policy_obs, goal, integral=integral)

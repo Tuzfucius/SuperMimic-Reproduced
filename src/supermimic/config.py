@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +69,8 @@ class IntegralCfg:
     critic_input: bool = False
     gradient_mode: str = "full"  # full | detach
     reset_on_episode: bool = True
+    residual_enabled: bool = False
+    residual_max_gain: float = 0.4
 
 
 @dataclass
@@ -141,13 +144,19 @@ def resolve_config(cfg: TrainConfig) -> TrainConfig:
         raise ValueError("integral.tau_s must be > 0")
     if integral.clip_abs <= 0:
         raise ValueError("integral.clip_abs must be > 0")
+    if not math.isfinite(integral.residual_max_gain) or integral.residual_max_gain <= 0:
+        raise ValueError("integral.residual_max_gain must be finite and > 0")
+    if integral.residual_enabled and not integral.enabled:
+        raise ValueError("integral.residual_enabled requires integral.enabled=true")
     if integral.gradient_mode not in {"full", "detach"}:
         raise ValueError("integral.gradient_mode must be 'full' or 'detach'")
-    if integral.enabled and not integral.actor_input and not integral.critic_input:
+    if integral.enabled and not integral.actor_input and not integral.critic_input and not integral.residual_enabled:
         warnings.warn("integral.enabled is true but neither Actor nor Critic consumes the state", stacklevel=2)
     if integral.enabled and not integral.reset_on_episode:
         warnings.warn("integral state intentionally carries across Episode boundaries", stacklevel=2)
     cfg.policy.integral_dim = integral.dimension if integral.enabled and integral.actor_input else 0
+    cfg.policy.integral_residual_enabled = integral.residual_enabled
+    cfg.policy.integral_residual_max_gain = integral.residual_max_gain
     cfg.critic.integral_dim = integral.dimension if integral.enabled and integral.critic_input else 0
     cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
     return cfg
