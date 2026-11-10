@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import io
+import math
 import warnings
 from dataclasses import replace
 from pathlib import Path
@@ -19,7 +20,7 @@ from supermimic.imagination import rollout as rollout_module
 from supermimic.imagination.compiled import REWARD_TERM_NAMES
 from supermimic.imagination.rollout import imagine
 from supermimic.policy.checkpoint import is_b0_to_i4_init, prepare_state_dict
-from supermimic.policy.integral import IntegralPolicyRunner
+from supermimic.policy.integral import IntegralPolicyRunner, IntegralStateTracker
 from supermimic.policy.nets import Critic, Policy, PolicyCfg
 from supermimic.training.loop import Trainer
 
@@ -426,3 +427,169 @@ def test_real_imagined_and_evaluation_paths_pass_integral_to_same_policy(monkeyp
     assert torch.equal(eval_nonzero, runner_policy(obs["policy"], obs["goal"], integral=runner.state))
     runner.reset(torch.tensor([True]))
     assert torch.count_nonzero(runner.state) == 0
+
+
+class _SequenceLibrary(_ToyLibrary):
+    def __init__(self, errors):
+        self.errors = errors
+        self.default_joint_pos = torch.zeros(29)
+
+    def goal_window(self, frame, k):
+        n = frame.numel()
+        goal = torch.zeros(n, k, 68)
+        goal[..., :29] = self.errors[:n, None, :]
+        return goal.reshape(n, k * 68)
+
+
+def _sequence_start(num_envs, integral):
+    state = torch.zeros(num_envs, 71)
+    state[:, 3] = 1.0
+    return StartBatch(
+        state=state,
+        xi=torch.zeros(num_envs, 33),
+        frame=torch.zeros(num_envs, dtype=torch.long),
+        prev_action=torch.zeros(num_envs, 29),
+        hist_states=state.unsqueeze(0).expand(2, -1, -1).clone(),
+        hist_actions=torch.zeros(2, num_envs, 29),
+        integral=integral,
+    )
+
+
+def test_five_step_integral_and_actions_align_across_train_imagine_and_runner(monkeypatch):
+    _, policy = _paired_policies()
+    with torch.no_grad():
+        policy.integral_gain_raw.fill_(0.6)
+    gain = 0.4 * torch.tanh(policy.integral_gain_raw.detach())
+    errors = torch.stack([torch.full((29,), value) for value in (0.1, 0.2, 0.3)])
+    library = _SequenceLibrary(errors)
+    num_envs, horizon = 3, 5
+    observation = {"policy": torch.zeros(num_envs, 186), "goal": library.goal_window(torch.zeros(num_envs, dtype=torch.long), 1)}
+
+    monkeypatch.setattr(rollout_module, "analytic_observation", lambda s, a, xi, q0: torch.zeros(s.shape[0], 93))
+    monkeypatch.setattr(
+        rollout_module,
+        "flatten_history_term_major",
+        lambda hist: hist.permute(1, 0, 2).reshape(hist.shape[1], -1),
+    )
+    monkeypatch.setattr(rollout_module, "reference_at", _fake_reference_at)
+    imagined = imagine(
+        _ToyWorldModel(), policy, library, _sequence_start(num_envs, torch.zeros(num_envs, 29)),
+        horizon=horizon, future_frames=1, obs_noise=False, step_fn=_ActionCaptureStep(),
+        integral_enabled=True, integral_dim=29, integral_dt_s=0.02,
+        integral_tau_s=2.0, integral_clip_abs=0.5, integral_actor_input=False,
+        integral_residual_enabled=True,
+    )
+
+    # Independent scalar recurrence, rather than calling update_integral as the oracle.
+    beta = math.exp(-0.02 / 2.0)
+    expected_z = torch.zeros(num_envs, 29)
+    expected_states = [expected_z.clone()]
+    base = policy.decoder(policy.encoders["motion"](observation["goal"]), observation["policy"])
+    for t in range(horizon):
+        expected_action = base + gain * expected_z
+        assert torch.allclose(imagined.integrals[t], expected_z, atol=1e-7, rtol=0)
+        assert torch.allclose(imagined.actions[t], expected_action, atol=1e-7, rtol=0)
+        expected_z = (beta * expected_z + 0.02 * errors).clamp(-0.5, 0.5)
+        expected_states.append(expected_z.clone())
+    assert torch.allclose(imagined.integrals, torch.stack(expected_states), atol=1e-7, rtol=0)
+    assert torch.count_nonzero(imagined.actions[1] - base) > 0  # nonzero gain exposes any one-frame shift
+
+    tracker = IntegralStateTracker(num_envs, 29, "cpu")
+    trainer = Trainer.__new__(Trainer)
+    trainer.policy = policy
+    trainer.integral_tracker = tracker
+    trainer.cfg = SimpleNamespace(integral=IntegralCfg(
+        enabled=True, actor_input=False, critic_input=False, residual_enabled=True,
+    ))
+    trainer._real_action_abs_sums = torch.zeros(2)
+    trainer._real_action_abs_max = torch.zeros(2)
+    trainer._real_action_count = 0
+
+    runner_policy = Policy(_small_cfg(residual=True))
+    runner_policy.load_state_dict(policy.state_dict(), strict=True)
+    runner_policy.integral_options = {
+        "enabled": True, "dimension": 29, "actor_input": False, "residual_enabled": True,
+        "tau_s": 2.0, "clip_abs": 0.5, "reset_on_episode": True,
+    }
+    runner_policy.control_dt_s = 0.02
+    command = SimpleNamespace(
+        frame=torch.tensor([0, 10, 20]),
+        library=SimpleNamespace(frame_clip=torch.tensor([0] * 10 + [1] * 10 + [2] * 12)),
+    )
+    runner = IntegralPolicyRunner(runner_policy, command)
+
+    z_train = torch.zeros(num_envs, 29)
+    z_eval = torch.zeros_like(z_train)
+    pending_error = torch.zeros_like(z_train)
+    for t in range(horizon):
+        obs = {"policy": observation["policy"], "goal": observation["goal"]}
+        action_train = trainer.act(obs)
+        action_eval = runner(obs)
+        assert torch.allclose(action_train, imagined.actions[t], atol=1e-7, rtol=0)
+        assert torch.allclose(action_eval, imagined.actions[t], atol=1e-7, rtol=0)
+        assert torch.allclose(tracker.state, z_train, atol=1e-7, rtol=0)
+        assert torch.allclose(runner.state, z_eval, atol=1e-7, rtol=0)
+        z_train = (beta * z_train + 0.02 * errors).clamp(-0.5, 0.5)
+        tracker.update(errors, 0.02, 2.0, 0.5)
+        pending_error = errors
+        z_eval = (beta * z_eval + 0.02 * pending_error).clamp(-0.5, 0.5)
+        command.frame += 1
+
+
+def test_three_env_runner_resets_are_isolated_across_frame_and_clip_transitions():
+    _, policy = _paired_policies()
+    with torch.no_grad():
+        policy.integral_gain_raw.fill_(0.8)
+    errors = torch.stack([torch.full((29,), value) for value in (0.1, 0.2, 0.3)])
+    goal = torch.zeros(3, 68)
+    goal[:, :29] = errors
+    obs = {"policy": torch.zeros(3, 186), "goal": goal}
+    command = SimpleNamespace(
+        frame=torch.tensor([0, 10, 20]),
+        library=SimpleNamespace(frame_clip=torch.tensor([0] * 10 + [1] * 10 + [2] * 12)),
+    )
+    policy.integral_options = {
+        "enabled": True, "dimension": 29, "actor_input": False, "residual_enabled": True,
+        "tau_s": 2.0, "clip_abs": 0.5, "reset_on_episode": True,
+    }
+    policy.control_dt_s = 0.02
+    runner = IntegralPolicyRunner(policy, command)
+    beta = math.exp(-0.02 / 2.0)
+    gain = 0.4 * torch.tanh(policy.integral_gain_raw.detach())
+    z = torch.zeros(3, 29)
+    base = policy.decoder(policy.encoders["motion"](goal), obs["policy"])
+
+    def act_and_check(expected):
+        actual = runner(obs)
+        assert torch.allclose(runner.state, expected, atol=1e-7, rtol=0)
+        assert torch.allclose(actual - base, gain * expected, atol=1e-7, rtol=0)
+        return actual
+
+    act_and_check(z)  # first call uses z_0
+    command.frame[:] = torch.tensor([1, 11, 21])
+    z = (beta * z + 0.02 * errors).clamp(-0.5, 0.5)
+    act_and_check(z)
+
+    # Env 0 jumps back to the first frame; env 1 repeats its frame; env 2 changes clip.
+    command.frame[:] = torch.tensor([0, 11, 10])
+    z = (beta * z + 0.02 * errors).clamp(-0.5, 0.5)
+    z[[0, 2]] = 0
+    act_and_check(z)
+    runner.reset(torch.tensor([False, True, False]))  # bool mask resets only env 1
+    z[1] = 0
+    assert torch.equal(runner.state, z)
+
+    command.frame[:] = torch.tensor([1, 12, 11])
+    next_z = (beta * z + 0.02 * errors).clamp(-0.5, 0.5)
+    next_z[1] = 0  # explicit reset also cleared env 1's pending error / has_previous flag
+    z = next_z
+    act_and_check(z)
+
+    runner.reset(torch.tensor([2]))  # environment-index reset
+    z[2] = 0
+    assert torch.equal(runner.state, z)
+    command.frame[:] = torch.tensor([2, 13, 12])
+    next_z = (beta * z + 0.02 * errors).clamp(-0.5, 0.5)
+    next_z[2] = 0  # env 2 has no prior error after explicit reset
+    z = next_z
+    act_and_check(z)

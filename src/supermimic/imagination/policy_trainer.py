@@ -110,7 +110,7 @@ class PolicyTrainer:
                 "imag/integral_abs_mean": float(iz.abs().mean()),
                 "imag/integral_norm": float(iz.norm(dim=-1).mean()),
                 "imag/integral_clip_fraction": float((iz.abs() >= (ic.clip_abs if ic else 0.5)).float().mean()),
-                "imag/joint_tracking_error": float(ro.joint_errors.abs().mean()),
+                "imag/joint_tracking_error": float(ro.joint_errors.detach().abs().mean()),
             })
         if ro.integral_action_metrics is not None:
             gain = self.integral_cfg.residual_max_gain * torch.tanh(self.policy.integral_gain_raw.detach())
