@@ -32,6 +32,7 @@ def main(ckpt: Path, clips: list[str], npz_dir: Path = Path("data/npz/bones_seed
     n = len(files)
     args = SuperMimicEnvCfgArgs(
         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
+        history_length=cfg["policy"].get("history", 10),
         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start",
         record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False),
         sim_timestep_s=cfg["env"].get("sim_timestep_s", 0.005),
@@ -65,6 +66,8 @@ def main(ckpt: Path, clips: list[str], npz_dir: Path = Path("data/npz/bones_seed
             steps += alive.long()
             done = (term | tout) & alive
             alive &= ~done
+            if done.any():
+                policy_runner.reset(done.nonzero().squeeze(-1))
             if alive.any():
                 snapshot()
             if steps.max() > 20000:

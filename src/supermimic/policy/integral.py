@@ -61,7 +61,8 @@ class IntegralPolicyRunner:
 
     ``act`` is called before each environment step. The current observation determines
     the action with ``z_t``; its error is carried forward and committed on the next call.
-    Frame/clip discontinuities identify the auto-reset that happened inside ``env.step``.
+    Frame/clip discontinuities identify most auto-resets; callers with a reset signal should
+    call ``reset`` explicitly, which also handles resets to the same reference frame.
     """
 
     def __init__(self, policy, command):
@@ -72,6 +73,27 @@ class IntegralPolicyRunner:
         self.previous_error: torch.Tensor | None = None
         self.previous_frame: torch.Tensor | None = None
         self.previous_clip: torch.Tensor | None = None
+        self.has_previous: torch.Tensor | None = None
+
+    @torch.no_grad()
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        """Forget integral history for all or selected environments after a real reset."""
+        if self.state is None:
+            return
+        if env_ids is None:
+            ids = torch.arange(self.state.shape[0], device=self.state.device)
+        else:
+            ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.state.device).reshape(-1)
+        if self.options.get("reset_on_episode", True):
+            self.state[ids] = 0
+        if self.previous_error is not None:
+            self.previous_error[ids] = 0
+        if self.previous_frame is not None:
+            self.previous_frame[ids] = 0
+        if self.previous_clip is not None:
+            self.previous_clip[ids] = 0
+        if self.has_previous is not None:
+            self.has_previous[ids] = False
 
     @torch.no_grad()
     def __call__(self, obs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -82,6 +104,10 @@ class IntegralPolicyRunner:
         num_envs = policy_obs.shape[0]
         if self.state is None or self.state.shape[0] != num_envs:
             self.state = torch.zeros(num_envs, self.options.get("dimension", 29), device=policy_obs.device)
+            self.previous_error = torch.zeros_like(self.state)
+            self.previous_frame = torch.zeros(num_envs, dtype=torch.long, device=policy_obs.device)
+            self.previous_clip = torch.zeros_like(self.previous_frame)
+            self.has_previous = torch.zeros(num_envs, dtype=torch.bool, device=policy_obs.device)
 
         frame = self.command.frame
         clip = self.command.library.frame_clip[frame]
@@ -93,7 +119,17 @@ class IntegralPolicyRunner:
                 self.options.get("tau_s", 2.0),
                 self.options.get("clip_abs", 0.5),
             )
-            reset = (frame != self.previous_frame + 1) | (clip != self.previous_clip)
+            has_previous = self.has_previous
+            next_state = torch.where(has_previous[:, None], next_state, self.state)
+            # A completed clip clamps its frame at the last sample. Holding that frame is
+            # continuous; jumps and clip changes indicate an automatic episode reset.
+            reset = (
+                ((frame != self.previous_frame + 1) & (frame != self.previous_frame))
+                | (clip != self.previous_clip)
+            ) & has_previous
+            env_reset = getattr(getattr(self.command, "_env", None), "reset_buf", None)
+            if env_reset is not None:
+                reset |= env_reset.to(device=reset.device, dtype=torch.bool) & has_previous
             if self.options.get("reset_on_episode", True):
                 next_state = torch.where(reset[:, None], torch.zeros_like(next_state), next_state)
             self.state = next_state
@@ -101,7 +137,8 @@ class IntegralPolicyRunner:
         history = self.policy.cfg.history
         error = goal[:, : self.state.shape[-1]] - policy_obs[:, (history - 1) * 29 : history * 29]
         self.previous_error = error
-        self.previous_frame = frame.clone()
-        self.previous_clip = clip.clone()
+        self.previous_frame.copy_(frame)
+        self.previous_clip.copy_(clip)
+        self.has_previous[:] = True
         integral = self.state if self.options.get("actor_input", True) else None
         return self.policy(policy_obs, goal, integral=integral)

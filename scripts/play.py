@@ -41,6 +41,7 @@ def main(
         npz_files=files,
         num_envs=num_envs,
         future_frames=cfg["env"]["future_frames"],
+        history_length=cfg["policy"].get("history", 10),
         episode_length_s=1.0e5,
         action_noise_std=0.0,
         obs_noise=False,
@@ -58,6 +59,14 @@ def main(
     command = base_env.command_manager.get_term("motion")
     env = RslRlVecEnvWrapper(base_env)
     pol = IntegralPolicyRunner(policy, command)
+    reset_env = env.reset
+
+    def reset_with_integral(*args, **kwargs):
+        result = reset_env(*args, **kwargs)
+        pol.reset()
+        return result
+
+    env.reset = reset_with_integral
     if viewer == "auto":
         viewer = "native" if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) else "viser"
     print(f"[INFO] {len(files)} clip(s), {num_envs} env(s), viewer={viewer}")

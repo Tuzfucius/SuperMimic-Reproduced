@@ -74,6 +74,7 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
         reset_noise=False, domain_randomization=False, sampling_mode="start",
         record_transitions=False, episode_length_s=1e5,
         future_frames=cfg["env"]["future_frames"], anchor_obs=cfg["env"].get("anchor_obs", False),
+        history_length=cfg["policy"].get("history", 10),
         sim_timestep_s=cfg["env"].get("sim_timestep_s", 0.005),
         decimation=cfg["env"].get("decimation", 4), seed=0,
     )
@@ -84,6 +85,7 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
     dt = env.step_dt
     for speed in speeds:
         obs, _ = env.reset()
+        policy_runner.reset()
         fallen = torch.zeros(num_envs, dtype=torch.bool, device=device)
         settle_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
         calm = torch.zeros(num_envs, dtype=torch.long, device=device)
@@ -97,8 +99,11 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
                 robot.write_root_link_velocity_to_sim(v)
                 pushed = True
             act = policy_runner(obs)
-            obs, _, term, _, _ = env.step(act)
+            obs, _, term, tout, _ = env.step(act)
             fallen |= term
+            done = term | tout
+            if done.any():
+                policy_runner.reset(done.nonzero().squeeze(-1))
             if pushed:
                 err = torch.norm(cmd.root_pos_w - cmd.robot_root_pos_w, dim=-1)
                 spd = torch.norm(robot.data.root_link_lin_vel_w, dim=-1)

@@ -31,6 +31,22 @@ class ClipResult:
     terms: dict | None = None  # per-term mean reward per step (dt-scaled)
 
 
+def evaluation_env_args(npz_files: list[str], cfg: dict, **overrides) -> SuperMimicEnvCfgArgs:
+    """Build every evaluation environment from the checkpoint's effective sizes."""
+    env_cfg = cfg.get("env", {})
+    policy_cfg = cfg.get("policy", {})
+    values = {
+        "npz_files": npz_files,
+        "history_length": int(policy_cfg.get("history", 10)),
+        "future_frames": int(env_cfg.get("future_frames", 10)),
+        "anchor_obs": bool(env_cfg.get("anchor_obs", False)),
+        "sim_timestep_s": float(env_cfg.get("sim_timestep_s", 0.005)),
+        "decimation": int(env_cfg.get("decimation", 4)),
+    }
+    values.update(overrides)
+    return SuperMimicEnvCfgArgs(**values)
+
+
 def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, dict]:
     ck = torch.load(path, map_location=device, weights_only=False)
     pc = ck["config"]["policy"]
@@ -47,12 +63,17 @@ def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, 
 
 
 @torch.no_grad()
-def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, anchor_obs: bool = False, sim_timestep_s: float = 0.005, decimation: int = 4) -> list[ClipResult]:
+def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, anchor_obs: bool = False, sim_timestep_s: float = 0.005, decimation: int = 4, history_length: int | None = None) -> list[ClipResult]:
     if abs(sim_timestep_s * decimation - 0.02) > 1e-9:
         raise ValueError("benchmark requires a 0.02s (50Hz) control interval to match the motion library")
     num_envs = min(num_envs or 1024, len(npz_files))
-    args = SuperMimicEnvCfgArgs(
-        npz_files=npz_files,
+    history_length = policy.cfg.history if history_length is None else history_length
+    args = evaluation_env_args(
+        npz_files,
+        {"policy": {"history": history_length}, "env": {
+            "future_frames": future_frames, "anchor_obs": anchor_obs,
+            "sim_timestep_s": sim_timestep_s, "decimation": decimation,
+        }},
         num_envs=num_envs,
         future_frames=future_frames,
         episode_length_s=1.0e5,  # clip end decides
@@ -63,9 +84,6 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         sampling_mode="start",
         record_transitions=False,
         seed=0,
-        anchor_obs=anchor_obs,
-        sim_timestep_s=sim_timestep_s,
-        decimation=decimation,
     )
     env = make_env(args, device=device)
     try:
@@ -120,6 +138,7 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
                 finished = current[ids] >= n_clips
                 active[ids[finished]] = False
                 cmd.forced_frame[ids] = lib.clip_start[torch.clamp(nxt[ids], max=n_clips - 1)]
+                policy_runner.reset(ids)
                 ret_sum[ids] = 0.0
                 term_sum[ids] = 0.0
                 steps[ids] = 0

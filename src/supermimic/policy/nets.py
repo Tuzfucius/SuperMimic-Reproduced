@@ -62,8 +62,9 @@ class MotionEncoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, cfg: PolicyCfg, obs_dim: int = 930):
+    def __init__(self, cfg: PolicyCfg):
         super().__init__()
+        obs_dim = cfg.history * sum(dim for _, dim in OBS_TERMS)
         self.integral_dim = cfg.integral_dim
         self.mlp = MLP(cfg.latent_dim + obs_dim + cfg.integral_dim, cfg.decoder_hidden, ACT_DIM, last_gain=cfg.decoder_last_gain)
         self.register_buffer("scale", _obs_scale_vector(cfg))

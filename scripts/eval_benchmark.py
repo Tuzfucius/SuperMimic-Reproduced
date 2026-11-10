@@ -33,6 +33,7 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
         anchor_obs=cfg["env"].get("anchor_obs", False),
         sim_timestep_s=cfg["env"].get("sim_timestep_s", 0.005),
         decimation=cfg["env"].get("decimation", 4),
+        history_length=cfg["policy"].get("history", 10),
     )
     s = summarize(results)
     print(f"\n{s['clips']} clips | failed {s['failed']} | mean norm return {s['mean_norm_return']:.4f} | step-weighted {s['step_weighted_norm_return']:.4f}")

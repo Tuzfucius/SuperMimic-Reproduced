@@ -38,6 +38,7 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
     n = len(files)
     args = SuperMimicEnvCfgArgs(
         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
+        history_length=cfg["policy"].get("history", 10),
         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False,
         sampling_mode="start", record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False),
         sim_timestep_s=cfg["env"].get("sim_timestep_s", 0.005),
@@ -97,6 +98,8 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
             obs, _, term, tout, _ = env.step(act)
             done = (term | tout) & active
             failed |= term & active
+            if done.any():
+                policy_runner.reset(done.nonzero().squeeze(-1))
             active &= ~done
         st = steps.clamp(min=1)
         rows = []
