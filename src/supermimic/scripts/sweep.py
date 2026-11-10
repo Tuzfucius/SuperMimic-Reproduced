@@ -85,6 +85,42 @@ def _clean_git_identity() -> dict:
     return {"commit": info.get("commit"), "dirty": bool(info.get("dirty")), "status": info.get("status", "unknown")}
 
 
+def _validate_git_output_root(output_root: Path) -> None:
+    """Reject repository-local output paths that can mutate the recorded Git identity."""
+    output_root = output_root.expanduser().resolve()
+    repo_proc = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=Path.cwd(), capture_output=True, text=True, check=False,
+    )
+    if repo_proc.returncode:
+        return  # Outputs outside a Git worktree cannot dirty its identity.
+    repo_root = Path(repo_proc.stdout.strip()).resolve()
+    try:
+        relative = output_root.relative_to(repo_root)
+    except ValueError:
+        return
+    rel_arg = relative.as_posix() or "."
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", rel_arg],
+        cwd=repo_root, capture_output=True, text=True, check=False,
+    )
+    if tracked.returncode:
+        raise RuntimeError(f"could not inspect Sweep output_root in Git: {tracked.stderr.strip()}")
+    if tracked.stdout.strip():
+        raise ValueError(
+            f"Sweep output_root contains tracked files: {output_root}; choose an untracked output path"
+        )
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--quiet", "--", rel_arg],
+        cwd=repo_root, capture_output=True, text=True, check=False,
+    )
+    if ignored.returncode != 0:
+        raise ValueError(
+            f"Sweep output_root {output_root} is inside the Git worktree but not ignored; "
+            "add this path to .gitignore or choose an output directory outside the repository"
+        )
+
+
 def _load_sweep_config(row: dict, output_root: Path):
     overrides = [f"run_name={row['name']}", f"log_root={output_root}", *row["set"]]
     cfg = load_config(row["cfg"], overrides)
@@ -106,6 +142,7 @@ def _train_identity(
     row: dict,
     output_root: Path,
     file_sha256_cache: dict[str, str] | None = None,
+    code_identity: dict | None = None,
 ) -> tuple[dict, str]:
     cfg = _load_sweep_config(row, output_root)
     resolved = config_dict(cfg)
@@ -136,7 +173,7 @@ def _train_identity(
         "config": resolved,
         "dataset": dataset,
         "initialization": initialization,
-        "code": _clean_git_identity(),
+        "code": _clean_git_identity() if code_identity is None else code_identity,
     }
     return identity, _hash(identity)
 
@@ -145,6 +182,7 @@ def _evaluation_identity(
     checkpoint: Path,
     eval_cfg: dict,
     file_sha256_cache: dict[str, str] | None = None,
+    code_identity: dict | None = None,
 ) -> tuple[dict, str]:
     dataset = _dataset_identity(eval_cfg.get("dataset"), file_sha256_cache)
     params = {key: value for key, value in eval_cfg.items() if key not in {"enabled", "dataset", "checkpoint"}}
@@ -160,7 +198,7 @@ def _evaluation_identity(
         "parameters": params,
         "checkpoint_selector": eval_cfg.get("checkpoint", "latest"),
         "checkpoint": _checkpoint_identity(checkpoint, file_sha256_cache),
-        "code": _clean_git_identity(),
+        "code": _clean_git_identity() if code_identity is None else code_identity,
     }
     return identity, _hash(identity)
 
@@ -345,12 +383,14 @@ def main() -> None:
     root = Path(spec.get("output_root", "runs"))
     group = spec.get("name", args.cfg.stem)
     root = (root / group).resolve()
+    _validate_git_output_root(root)
     eval_cfg = spec.get("evaluation", {}) or {}
     eval_enabled = bool(eval_cfg.get("enabled", False))
     # Resolve all row configs before running or printing the matrix so Resume and
     # missing initialization checkpoints cannot be silently accepted by Sweep.
     for row in rows:
-        _load_sweep_config(row, root)
+        resolved_cfg = _load_sweep_config(row, root)
+        _validate_git_output_root(Path(resolved_cfg.log_root))
     allowed_eval_keys = {"enabled", "dataset", "num_envs", "device", "checkpoint", "clips", "clip_list", "manifest"}
     unknown_eval_keys = set(eval_cfg) - allowed_eval_keys
     if unknown_eval_keys:
@@ -373,6 +413,9 @@ def main() -> None:
             print(f"benchmark: {eval_cfg.get('dataset')} with {eval_cfg.get('num_envs', 256)} envs after successful training")
         return
 
+    # Capture source identity once before this Sweep creates any run files. Its
+    # value then stays stable across seeds and evaluations in the same invocation.
+    code_identity = _clean_git_identity()
     root.mkdir(parents=True, exist_ok=True)
     results = []
     # A single in-memory cache avoids rereading the same large motion files for
@@ -381,7 +424,9 @@ def main() -> None:
     for row in rows:
         run_dir = root / row["name"]
         meta_path = run_dir / "metadata.json"
-        requested_identity, requested_hash = _train_identity(row, root, file_sha256_cache)
+        requested_identity, requested_hash = _train_identity(
+            row, root, file_sha256_cache, code_identity=code_identity,
+        )
         metadata: dict = {}
         should_train = True
         if meta_path.exists():
@@ -418,7 +463,9 @@ def main() -> None:
                     "training_identity_sha256": requested_hash,
                 })
                 continue
-            eval_identity, eval_hash = _evaluation_identity(checkpoint, eval_cfg, file_sha256_cache)
+            eval_identity, eval_hash = _evaluation_identity(
+                checkpoint, eval_cfg, file_sha256_cache, code_identity=code_identity,
+            )
             result_files_exist = (run_dir / "eval_metrics.json").is_file() and (run_dir / "benchmark.json").is_file()
             eval_done = (
                 metadata.get("evaluation_state") == "completed"
@@ -494,7 +541,9 @@ def main() -> None:
         if eval_enabled:
             try:
                 checkpoint = _select_checkpoint(run_dir, metadata, eval_cfg)
-                eval_identity, eval_hash = _evaluation_identity(checkpoint, eval_cfg, file_sha256_cache)
+                eval_identity, eval_hash = _evaluation_identity(
+                    checkpoint, eval_cfg, file_sha256_cache, code_identity=code_identity,
+                )
             except OSError as exc:
                 metrics, eval_error, eval_hash, eval_identity = None, str(exc), None, None
             else:

@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,10 +65,14 @@ def test_sweep_dry_run_does_not_check_dataset_or_launch_process(tmp_path, monkey
         "enabled": True, "dataset": str(tmp_path / "missing"), "num_envs": 8,
     })
     monkeypatch.setattr(sys, "argv", ["sm-sweep", "--cfg", str(cfg_path), "--dry-run"])
-    monkeypatch.setattr(
-        "supermimic.scripts.sweep.subprocess.run",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("launched process")),
-    )
+    real_run = subprocess.run
+
+    def reject_non_git_process(command, *args, **kwargs):
+        if command and command[0] == "git":
+            return real_run(command, *args, **kwargs)
+        raise AssertionError("launched process")
+
+    monkeypatch.setattr("supermimic.scripts.sweep.subprocess.run", reject_non_git_process)
     main()
     output = capsys.readouterr().out
     assert "matrix: 1 runs" in output
@@ -92,9 +97,12 @@ def test_sweep_reuses_training_only_when_eval_identity_matches(tmp_path, monkeyp
     calls = []
     train_calls = 0
     eval_calls = 0
+    real_run = subprocess.run
 
     def fake_run(command, **kwargs):
         nonlocal train_calls, eval_calls
+        if command and command[0] == "git":
+            return real_run(command, **kwargs)
         calls.append(command)
         if "supermimic.scripts.train" in command:
             train_calls += 1
@@ -165,9 +173,12 @@ def test_training_success_evaluation_failure_retries_only_evaluation(tmp_path, m
     run_dir = None
     train_calls = 0
     eval_calls = 0
+    real_run = subprocess.run
 
     def fake_run(command, **kwargs):
         nonlocal train_calls, eval_calls, run_dir
+        if command and command[0] == "git":
+            return real_run(command, **kwargs)
         if "supermimic.scripts.train" in command:
             train_calls += 1
             run_name = command[command.index("--set") + 1].split("=", 1)[1]

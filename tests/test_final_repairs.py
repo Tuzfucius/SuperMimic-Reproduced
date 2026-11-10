@@ -1,5 +1,6 @@
 import copy
 import json
+import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -328,8 +329,11 @@ def test_existing_sweep_run_reuse_requires_exact_training_identity(tmp_path, mon
     row = expand({"experiments": [{"id": "I1", "cfg": "train.yaml", "seeds": [0]}]}, cfg_path)[0]
     run_dir = output / "identity" / row["name"]
     calls = []
+    real_run = subprocess.run
 
     def fake_run(command, **kwargs):
+        if command and command[0] == "git":
+            return real_run(command, **kwargs)
         calls.append(command)
         checkpoint = run_dir / "checkpoints" / "ckpt_latest.pt"
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
