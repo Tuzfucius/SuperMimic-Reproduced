@@ -10,12 +10,18 @@ from pathlib import Path
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from supermimic.config import IntegralCfg, TrainConfig, resolve_config
+from supermimic.config import TrainConfig, resolve_config
 from supermimic.data.motion_convert import load_g1_model
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, ROOT_BODY, TRACKED_BODIES
-from supermimic.experiment import create_run, update_run
+from supermimic.experiment import (
+    checkpoint_run_dir,
+    create_run,
+    open_resume_run,
+    update_run,
+    validate_resume_config,
+)
 from supermimic.imagination.policy_trainer import PolicyTrainer
 from supermimic.kinematics.g1_fk import G1Kinematics
 from supermimic.policy.integral import IntegralStateTracker
@@ -23,6 +29,7 @@ from supermimic.policy.nets import Critic, Policy
 from supermimic.training.distributed import (
     allreduce_mean,
     broadcast_params,
+    broadcast_setup_error,
     finalize,
     init_distributed,
 )
@@ -34,13 +41,11 @@ from supermimic.world_model.world_model import WorldModel
 
 class Trainer:
     def __init__(self, cfg: TrainConfig):
-        # A resume checkpoint is the source of truth for the stateful policy interface.
-        # This avoids rebuilding a 0-integral network for an integral checkpoint.
+        # Resume operates in the original run directory; it does not create a new experiment.
         if cfg.resume is not None:
-            resume_ck = torch.load(cfg.resume, map_location="cpu", weights_only=False)
-            saved_integral = resume_ck.get("config", {}).get("integral")
-            if saved_integral is not None:
-                cfg.integral = IntegralCfg(**saved_integral)
+            resume_dir = checkpoint_run_dir(cfg.resume)
+            cfg.log_root = resume_dir.parent
+            cfg.run_name = resume_dir.name
         self.cfg = resolve_config(cfg)
         cfg = self.cfg
         self.rank, local_rank, self.world = init_distributed()
@@ -53,10 +58,31 @@ class Trainer:
             cfg.policy_trainer.critic_lr *= self.world**0.5
         torch.manual_seed(cfg.seed + 1000 * self.rank)
         self.device = cfg.device
-        self.log_dir, self.run_metadata = create_run(cfg) if self.is_main else (Path(cfg.log_root) / cfg.run_name, {})
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        (self.log_dir / "checkpoints").mkdir(exist_ok=True)
+        self.log_dir = Path(cfg.log_root) / cfg.run_name
+        self.run_metadata = {}
+        setup_error = None
         if self.is_main:
+            try:
+                if cfg.resume is not None:
+                    resume_ck = torch.load(cfg.resume, map_location="cpu", weights_only=False)
+                    if "config" not in resume_ck:
+                        raise ValueError(
+                            "resume checkpoint has no saved configuration; strict resume validation is unavailable"
+                        )
+                    validate_resume_config(cfg, resume_ck["config"])
+                    self.log_dir, self.run_metadata = open_resume_run(cfg, cfg.resume)
+                else:
+                    self.log_dir, self.run_metadata = create_run(cfg)
+                (self.log_dir / "checkpoints").mkdir(exist_ok=True)
+            except Exception as exc:  # noqa: BLE001 - all rank-zero failures must reach every rank
+                setup_error = f"{type(exc).__name__}: {exc}"
+        setup_error = broadcast_setup_error(setup_error)
+        if setup_error is not None:
+            finalize()
+            raise RuntimeError(f"experiment directory initialization failed: {setup_error}")
+        if self.world > 1:
+            torch.distributed.barrier()
+        if self.is_main and cfg.resume is None:
             (self.log_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2, default=str))
         self.writer = SummaryWriter(str(self.log_dir / "tb")) if self.is_main else None
 
@@ -140,6 +166,7 @@ class Trainer:
         payload = {
                 "iteration": self.iteration,
                 "num_updates": self.num_updates,
+                "utd_accumulator": self._utd_acc,
                 "wm": self.wm.state_dict(),
                 "policy": self.policy.state_dict(),
                 "critic": self.critic.state_dict(),
@@ -178,15 +205,19 @@ class Trainer:
             mode = "resume" if resume else "init_from"
             raise RuntimeError(f"checkpoint {mode} is structurally incompatible with configured model: {exc}") from exc
         if resume:
-            self.wm_trainer.opt.load_state_dict(ck["wm_opt"])
-            self.policy_trainer.opt.load_state_dict(ck["policy_opt"])
-            self.policy_trainer.critic_opt.load_state_dict(ck["critic_opt"])
-            if "bin_return" in ck:
-                self.command.bin_return.copy_(ck["bin_return"])
-                self.command.bin_memory.copy_(ck["bin_memory"])
+            try:
+                self.wm_trainer.opt.load_state_dict(ck["wm_opt"])
+                self.policy_trainer.opt.load_state_dict(ck["policy_opt"])
+                self.policy_trainer.critic_opt.load_state_dict(ck["critic_opt"])
+                if "bin_return" in ck:
+                    self.command.bin_return.copy_(ck["bin_return"])
+                    self.command.bin_memory.copy_(ck["bin_memory"])
+            except (KeyError, RuntimeError, ValueError) as exc:
+                raise RuntimeError(f"checkpoint resume optimizer/sampler state is incompatible: {exc}") from exc
             self.iteration = ck["iteration"]
             self.start_iteration = self.iteration
             self.num_updates = ck["num_updates"]
+            self._utd_acc = float(ck.get("utd_accumulator", 0.0))
             print(f"[INFO] resumed model/optimizer/sampler from {path} at iteration {self.iteration}; environment and replay restarted")
         else:
             print(f"[INFO] initialized weights from {path}; optimizer, counters, environment and replay start fresh")
@@ -211,6 +242,13 @@ class Trainer:
         finished_lens: list[float] = []
         last_log = time.time()
         metric_history: list[dict[str, float]] = []
+        metrics_path = self.log_dir / "metrics.json"
+        if cfg.resume is not None and metrics_path.exists():
+            try:
+                saved_metrics = json.loads(metrics_path.read_text())
+                metric_history = saved_metrics.get("history", saved_metrics.get("recent", []))
+            except (OSError, json.JSONDecodeError):
+                metric_history = []
 
         while self.iteration < sch.total_iterations:
             # ---------------- (1) collect one vectorised env step
@@ -222,6 +260,8 @@ class Trainer:
             self.ep_len += 1
             done = term | tout
             if self.integral_tracker is not None:
+                # Recorder hooks run inside env.step and write the pre-update z_t beside a_t.
+                # Commit the observation error only after env.step returns, producing z_(t+1).
                 # Policy-visible term-major joint-position history; newest sample is frame history-1.
                 h = cfg.policy.history
                 q_obs = obs_t["policy"][:, (h - 1) * 29 : h * 29]
@@ -339,8 +379,8 @@ class Trainer:
                     break
         self.save("ckpt_latest.pt")
         if self.is_main:
-            (self.log_dir / "metrics.json").write_text(json.dumps({"iterations": self.iteration, "updates": self.num_updates, "recent": metric_history[-100:]}, indent=2))
-            update_run(self.log_dir, self.run_metadata, state="completed", finished_at=time.time(), elapsed_s=time.time() - t_start)
+            metrics_path.write_text(json.dumps({"iterations": self.iteration, "updates": self.num_updates, "history": metric_history, "recent": metric_history[-100:]}, indent=2))
+            update_run(self.log_dir, self.run_metadata, state="completed", finished_at=time.time(), elapsed_s=self.run_metadata.get("elapsed_s", 0.0) + time.time() - t_start)
         if self.writer is not None:
             self.writer.flush()
         finalize()
