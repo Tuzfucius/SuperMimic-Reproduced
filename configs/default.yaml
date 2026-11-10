@@ -1,0 +1,12 @@
+run_name: debug
+log_root: logs
+seed: 0
+device: cuda:0
+data:
+  npz_dir: data/npz/lafan1
+env:
+  num_envs: 4096
+  future_frames: 10
+  anchor_obs: false
+integral:
+  enabled: false

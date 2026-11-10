@@ -35,7 +35,10 @@ class ReplayRecorder(RecorderTerm):
         self.command_name = p.get("command_name", "motion")
         self.action_name = p.get("action_name", "joint_pos")
         n = env.num_envs
-        self.buffer = ReplayBuffer(n, int(p["capacity"]), STATE_DIM, 29, XI_DIM, env.device)
+        integral_dim = int(p.get("integral_dim", 0))
+        self.integral_reset_on_episode = bool(p.get("integral_reset_on_episode", True))
+        self.buffer = ReplayBuffer(n, int(p["capacity"]), STATE_DIM, 29, XI_DIM, env.device, integral_dim)
+        self.integral_state = torch.zeros(n, integral_dim, device=env.device) if integral_dim else None
         self.prev_s = torch.zeros(n, STATE_DIM, device=env.device)
         self.prev_xi = torch.zeros(n, XI_DIM, device=env.device)
         self.prev_frame = torch.zeros(n, dtype=torch.long, device=env.device)
@@ -64,6 +67,8 @@ class ReplayRecorder(RecorderTerm):
             return
         self._remember(env_ids)
         self.ep_start[env_ids] = True
+        if self.integral_state is not None and self.integral_reset_on_episode:
+            self.integral_state[env_ids] = 0
 
     def _write_rows(self, ids: torch.Tensor, done_next: torch.Tensor) -> None:
         env = self._env
@@ -79,6 +84,7 @@ class ReplayRecorder(RecorderTerm):
             clip=self.prev_clip[ids],
             terminal=torch.zeros_like(done_next, dtype=torch.bool),
             ep_start=self.ep_start[ids],
+            integral=None if self.integral_state is None else self.integral_state[ids],
         )
         self.ep_start[ids] = False
 
@@ -104,6 +110,7 @@ class ReplayRecorder(RecorderTerm):
             clip=cmd.library.frame_clip[cmd.frame[env_ids]],
             terminal=torch.ones(env_ids.numel(), dtype=torch.bool, device=env.device),
             ep_start=torch.zeros(env_ids.numel(), dtype=torch.bool, device=env.device),
+            integral=None if self.integral_state is None else torch.zeros_like(self.integral_state[env_ids]),
         )
         self.buffer.end_episode(env_ids)
 

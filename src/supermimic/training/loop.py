@@ -10,15 +10,22 @@ from pathlib import Path
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from supermimic.config import TrainConfig
+from supermimic.config import IntegralCfg, TrainConfig, resolve_config
 from supermimic.data.motion_convert import load_g1_model
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.envs.tracking_env_cfg import ANCHOR_BODY, ROOT_BODY, TRACKED_BODIES
+from supermimic.experiment import create_run, update_run
 from supermimic.imagination.policy_trainer import PolicyTrainer
 from supermimic.kinematics.g1_fk import G1Kinematics
+from supermimic.policy.integral import IntegralStateTracker
 from supermimic.policy.nets import Critic, Policy
-from supermimic.training.distributed import allreduce_mean, broadcast_params, finalize, init_distributed, world_size
+from supermimic.training.distributed import (
+    allreduce_mean,
+    broadcast_params,
+    finalize,
+    init_distributed,
+)
 from supermimic.training.schedule import cosine_lr
 from supermimic.world_model.heads import AnalyticHeads
 from supermimic.world_model.wm_trainer import WorldModelTrainer
@@ -27,9 +34,15 @@ from supermimic.world_model.world_model import WorldModel
 
 class Trainer:
     def __init__(self, cfg: TrainConfig):
-        self.cfg = cfg
-        cfg.policy.goal_dim = cfg.env.future_frames * 68 + (9 if cfg.env.anchor_obs else 0)
-        cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
+        # A resume checkpoint is the source of truth for the stateful policy interface.
+        # This avoids rebuilding a 0-integral network for an integral checkpoint.
+        if cfg.resume is not None:
+            resume_ck = torch.load(cfg.resume, map_location="cpu", weights_only=False)
+            saved_integral = resume_ck.get("config", {}).get("integral")
+            if saved_integral is not None:
+                cfg.integral = IntegralCfg(**saved_integral)
+        self.cfg = resolve_config(cfg)
+        cfg = self.cfg
         self.rank, local_rank, self.world = init_distributed()
         self.is_main = self.rank == 0
         if self.world > 1:
@@ -40,8 +53,9 @@ class Trainer:
             cfg.policy_trainer.critic_lr *= self.world**0.5
         torch.manual_seed(cfg.seed + 1000 * self.rank)
         self.device = cfg.device
-        self.log_dir = Path(cfg.log_root) / cfg.run_name
+        self.log_dir, self.run_metadata = create_run(cfg) if self.is_main else (Path(cfg.log_root) / cfg.run_name, {})
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        (self.log_dir / "checkpoints").mkdir(exist_ok=True)
         if self.is_main:
             (self.log_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2, default=str))
         self.writer = SummaryWriter(str(self.log_dir / "tb")) if self.is_main else None
@@ -58,6 +72,7 @@ class Trainer:
                 npz_files=[str(f) for f in files],
                 num_envs=cfg.env.num_envs,
                 future_frames=cfg.env.future_frames,
+                history_length=cfg.policy.history,
                 episode_length_s=cfg.env.episode_length_s,
                 action_noise_std=cfg.env.action_noise_std,
                 obs_noise=cfg.env.obs_noise,
@@ -67,6 +82,10 @@ class Trainer:
                 replay_capacity=cfg.env.replay_capacity,
                 compact_library=cfg.env.compact_library,
                 anchor_obs=cfg.env.anchor_obs,
+                sim_timestep_s=cfg.env.sim_timestep_s,
+                decimation=cfg.env.decimation,
+                integral_dim=cfg.integral.dimension if cfg.integral.enabled else 0,
+                integral_reset_on_episode=cfg.integral.reset_on_episode,
                 seed=cfg.seed + 1000 * self.rank,
             ),
             device=self.device,
@@ -76,6 +95,11 @@ class Trainer:
         self.lib = self.command.library
         self.recorder = env.recorder_manager.get_term("replay")
         self.buffer = self.recorder.buffer
+        self.integral_tracker = (
+            IntegralStateTracker(env.num_envs, cfg.integral.dimension, self.device) if cfg.integral.enabled else None
+        )
+        if self.integral_tracker is not None:
+            self.recorder.integral_state = self.integral_tracker.state
         robot = env.scene["robot"]
 
         fk = G1Kinematics(load_g1_model(), device=self.device)
@@ -86,10 +110,14 @@ class Trainer:
         for m in (self.wm, self.policy, self.critic):
             broadcast_params(m)
         self.wm_trainer = WorldModelTrainer(self.wm, self.lib, cfg.wm_trainer)
-        self.policy_trainer = PolicyTrainer(self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer)
-        n_params = lambda m: sum(p.numel() for p in m.parameters())  # noqa: E731
+        self.policy_trainer = PolicyTrainer(
+            self.wm, self.policy, self.critic, self.lib, cfg.policy_trainer,
+            integral_cfg=cfg.integral, integral_dt_s=cfg.env.control_dt_s,
+        )
+        n_params = lambda m: sum(p.numel() for p in m.parameters())
         if self.is_main:
             print(f"[INFO] params: world model {n_params(self.wm)/1e6:.2f}M, policy {n_params(self.policy)/1e6:.2f}M, critic {n_params(self.critic)/1e6:.3f}M")
+            update_run(self.log_dir, self.run_metadata, model_parameters={"world_model": n_params(self.wm), "actor": n_params(self.policy), "critic": n_params(self.critic)})
 
         # Episode statistics of the training env (paper's "training return").
         self.ep_reward_sum = torch.zeros(env.num_envs, device=self.device)
@@ -100,15 +128,16 @@ class Trainer:
         self.num_updates = 0
         self._utd_acc = 0.0
         if cfg.resume is not None:
-            self.load(cfg.resume)
+            self.load(cfg.resume, resume=True)
+        if cfg.init_from is not None:
+            self.load(cfg.init_from, resume=False)
 
     # ------------------------------------------------------------------ checkpoints
 
     def save(self, name: str = "ckpt_latest.pt") -> None:
         if not self.is_main:
             return
-        torch.save(
-            {
+        payload = {
                 "iteration": self.iteration,
                 "num_updates": self.num_updates,
                 "wm": self.wm.state_dict(),
@@ -120,30 +149,54 @@ class Trainer:
                 "bin_return": self.command.bin_return,
                 "bin_memory": self.command.bin_memory,
                 "config": asdict(self.cfg),
-            },
-            self.log_dir / name,
+            }
+        checkpoint_path = self.log_dir / "checkpoints" / name
+        torch.save(
+            payload,
+            checkpoint_path,
         )
+        legacy_path = self.log_dir / name
+        if legacy_path.exists() or legacy_path.is_symlink():
+            legacy_path.unlink()
+        try:
+            import os
 
-    def load(self, path: Path) -> None:
+            os.link(checkpoint_path, legacy_path)
+        except OSError:
+            import shutil
+
+            shutil.copy2(checkpoint_path, legacy_path)
+        update_run(self.log_dir, self.run_metadata, checkpoint=str(checkpoint_path), iteration=self.iteration)
+
+    def load(self, path: Path, resume: bool = True) -> None:
         ck = torch.load(path, map_location=self.device, weights_only=False)
-        self.wm.load_state_dict(ck["wm"])
-        self.policy.load_state_dict(ck["policy"])
-        self.critic.load_state_dict(ck["critic"])
-        self.wm_trainer.opt.load_state_dict(ck["wm_opt"])
-        self.policy_trainer.opt.load_state_dict(ck["policy_opt"])
-        self.policy_trainer.critic_opt.load_state_dict(ck["critic_opt"])
-        self.command.bin_return.copy_(ck["bin_return"])
-        self.command.bin_memory.copy_(ck["bin_memory"])
-        self.iteration = ck["iteration"]
-        self.start_iteration = self.iteration
-        self.num_updates = ck["num_updates"]
-        print(f"[INFO] resumed from {path} at iteration {self.iteration}")
+        try:
+            self.wm.load_state_dict(ck["wm"])
+            self.policy.load_state_dict(ck["policy"])
+            self.critic.load_state_dict(ck["critic"])
+        except RuntimeError as exc:
+            mode = "resume" if resume else "init_from"
+            raise RuntimeError(f"checkpoint {mode} is structurally incompatible with configured model: {exc}") from exc
+        if resume:
+            self.wm_trainer.opt.load_state_dict(ck["wm_opt"])
+            self.policy_trainer.opt.load_state_dict(ck["policy_opt"])
+            self.policy_trainer.critic_opt.load_state_dict(ck["critic_opt"])
+            if "bin_return" in ck:
+                self.command.bin_return.copy_(ck["bin_return"])
+                self.command.bin_memory.copy_(ck["bin_memory"])
+            self.iteration = ck["iteration"]
+            self.start_iteration = self.iteration
+            self.num_updates = ck["num_updates"]
+            print(f"[INFO] resumed model/optimizer/sampler from {path} at iteration {self.iteration}; environment and replay restarted")
+        else:
+            print(f"[INFO] initialized weights from {path}; optimizer, counters, environment and replay start fresh")
 
     # ------------------------------------------------------------------ main loop
 
     @torch.no_grad()
     def act(self, obs) -> torch.Tensor:
-        return self.policy(obs["policy"], obs["goal"])
+        integral = self.integral_tracker.state if self.integral_tracker is not None and self.cfg.integral.actor_input else None
+        return self.policy(obs["policy"], obs["goal"], integral=integral)
 
     def run(self) -> None:
         cfg = self.cfg
@@ -157,15 +210,27 @@ class Trainer:
         finished_returns: list[float] = []
         finished_lens: list[float] = []
         last_log = time.time()
+        metric_history: list[dict[str, float]] = []
 
         while self.iteration < sch.total_iterations:
             # ---------------- (1) collect one vectorised env step
             t0 = time.perf_counter()
             action = self.act(obs)
-            obs, rew, term, tout, extras = env.step(action)
+            obs_t = obs
+            obs, rew, term, tout, _extras = env.step(action)
             self.ep_reward_sum += rew
             self.ep_len += 1
             done = term | tout
+            if self.integral_tracker is not None:
+                # Policy-visible term-major joint-position history; newest sample is frame history-1.
+                h = cfg.policy.history
+                q_obs = obs_t["policy"][:, (h - 1) * 29 : h * 29]
+                q_ref = obs_t["goal"][:, :29]
+                self.integral_tracker.update(
+                    q_ref - q_obs, cfg.env.control_dt_s, cfg.integral.tau_s, cfg.integral.clip_abs
+                )
+                if done.any() and cfg.integral.reset_on_episode:
+                    self.integral_tracker.reset(done.nonzero().squeeze(-1))
             if done.any():
                 ids = done.nonzero().squeeze(-1)
                 lens = self.ep_len[ids]
@@ -212,7 +277,7 @@ class Trainer:
                     tot = allreduce_mean(float(sum(finished_returns))) * self.world
                     cnt = allreduce_mean(float(len(finished_returns))) * self.world
                     finished_returns = [tot / cnt] if cnt > 0 else []
-                    n_finished = int(round(cnt))
+                    n_finished = round(cnt)
                 else:
                     n_finished = len(finished_returns)
                 if not self.is_main:
@@ -222,6 +287,7 @@ class Trainer:
                 elif agg_n > 0:
                     for k, v in agg.items():
                         self.writer.add_scalar(k, v / (agg_n if k != "lr" else 1), it)
+                    metric_history.append({k: v / (agg_n if k != "lr" else 1) for k, v in agg.items()})
                 if not self.is_main:
                     tr = float("nan")
                 elif finished_returns:
@@ -244,6 +310,9 @@ class Trainer:
                     self.writer.add_scalar("time/updates", self.num_updates, it)
                     self.writer.add_scalar("sampler/entropy", float(self.command.metrics["sampling_entropy"][0]), it)
                     self.writer.add_scalar("sampler/bin_return_mean", float(self.command.bin_return.mean()), it)
+                    if self.integral_tracker is not None:
+                        for key, value in self.integral_tracker.metrics().items():
+                            self.writer.add_scalar(f"policy/{key}", value, it)
                     dt_log = time.time() - last_log
                     last_log = time.time()
                     msg = (
@@ -269,6 +338,9 @@ class Trainer:
                         print("[INFO] max_hours reached, stopping")
                     break
         self.save("ckpt_latest.pt")
+        if self.is_main:
+            (self.log_dir / "metrics.json").write_text(json.dumps({"iterations": self.iteration, "updates": self.num_updates, "recent": metric_history[-100:]}, indent=2))
+            update_run(self.log_dir, self.run_metadata, state="completed", finished_at=time.time(), elapsed_s=time.time() - t_start)
         if self.writer is not None:
             self.writer.flush()
         finalize()

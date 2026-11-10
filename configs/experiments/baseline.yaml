@@ -1,0 +1,4 @@
+_base_: ../default.yaml
+run_name: B0
+integral:
+  enabled: false

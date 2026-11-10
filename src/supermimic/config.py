@@ -33,6 +33,12 @@ class EnvCfg:
     future_frames: int = 10
     compact_library: bool = False
     anchor_obs: bool = False
+    sim_timestep_s: float = 0.005
+    decimation: int = 4
+
+    @property
+    def control_dt_s(self) -> float:
+        return self.sim_timestep_s * self.decimation
 
 
 @dataclass
@@ -49,6 +55,19 @@ class ScheduleCfg:
 
 
 @dataclass
+class IntegralCfg:
+    enabled: bool = False
+    error_source: str = "joint_pos"
+    dimension: int = 29
+    tau_s: float = 2.0
+    clip_abs: float = 0.5
+    actor_input: bool = True
+    critic_input: bool = False
+    gradient_mode: str = "full"  # full | detach
+    reset_on_episode: bool = True
+
+
+@dataclass
 class TrainConfig:
     run_name: str = "debug"
     log_root: Path = Path("logs")
@@ -62,4 +81,37 @@ class TrainConfig:
     critic: CriticCfg = field(default_factory=CriticCfg)
     policy_trainer: PolicyTrainerCfg = field(default_factory=PolicyTrainerCfg)
     schedule: ScheduleCfg = field(default_factory=ScheduleCfg)
+    integral: IntegralCfg = field(default_factory=IntegralCfg)
     resume: Path | None = None
+    init_from: Path | None = None
+
+
+def resolve_config(cfg: TrainConfig) -> TrainConfig:
+    """Derive the single effective network/environment dimensions and validate dependencies."""
+    if cfg.env.future_frames < 1:
+        raise ValueError("env.future_frames must be >= 1")
+    if cfg.env.decimation < 1 or cfg.env.sim_timestep_s <= 0:
+        raise ValueError("env.decimation and env.sim_timestep_s must be positive")
+    # The simulator's composed control interval is the authority for both the
+    # explicit world-model integrator and the error-memory recurrence.
+    cfg.world_model.state_spec.dt = cfg.env.control_dt_s
+    if cfg.policy.history < 1:
+        raise ValueError("policy.history must be >= 1")
+    cfg.policy_trainer.history = cfg.policy.history
+    cfg.policy_trainer.future_frames = cfg.env.future_frames
+    cfg.policy.goal_dim = cfg.env.future_frames * 68 + (9 if cfg.env.anchor_obs else 0)
+    integral = cfg.integral
+    if integral.error_source != "joint_pos":
+        raise ValueError("integral.error_source currently supports only 'joint_pos'")
+    if integral.dimension != 29:
+        raise ValueError("integral.dimension must be 29 for G1 joint position tracking")
+    if integral.tau_s <= 0:
+        raise ValueError("integral.tau_s must be > 0")
+    if integral.clip_abs <= 0:
+        raise ValueError("integral.clip_abs must be > 0")
+    if integral.gradient_mode not in {"full", "detach"}:
+        raise ValueError("integral.gradient_mode must be 'full' or 'detach'")
+    cfg.policy.integral_dim = integral.dimension if integral.enabled and integral.actor_input else 0
+    cfg.critic.integral_dim = integral.dimension if integral.enabled and integral.critic_input else 0
+    cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs
+    return cfg

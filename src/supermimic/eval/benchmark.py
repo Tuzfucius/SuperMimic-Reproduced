@@ -16,6 +16,7 @@ from pathlib import Path
 import torch
 
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
+from supermimic.policy.integral import update_integral
 from supermimic.policy.nets import Policy, PolicyCfg
 
 
@@ -36,6 +37,8 @@ def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, 
     pcfg = PolicyCfg(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in pc.items()})
     policy = Policy(pcfg).to(device)
     policy.load_state_dict(ck["policy"])
+    policy.integral_options = ck["config"].get("integral", {"enabled": False})
+    policy.control_dt_s = ck["config"].get("env", {}).get("sim_timestep_s", 0.005) * ck["config"].get("env", {}).get("decimation", 4)
     policy.eval()
     return policy, ck["config"]
 
@@ -75,15 +78,25 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         steps = torch.zeros(num_envs, dtype=torch.long, device=device)
         term_names = list(env.reward_manager.active_terms)
         term_sum = torch.zeros(num_envs, len(term_names), device=device)
+        integral_cfg = getattr(policy, "integral_options", {"enabled": False})
+        z = torch.zeros(num_envs, 29, device=device) if integral_cfg.get("enabled", False) else None
         results: dict[int, ClipResult] = {}
         remaining = n_clips
         while remaining > 0:
-            act = policy(obs["policy"], obs["goal"])
+            obs_t = obs
+            act = policy(obs_t["policy"], obs_t["goal"], integral=z if z is not None and integral_cfg.get("actor_input", True) else None)
             obs, rew, term, tout, _ = env.step(act)
             ret_sum += rew
             term_sum += env.reward_manager.term_rewards
             steps += 1
             done = (term | tout) & active
+            if z is not None:
+                history = policy.cfg.history
+                q_obs = obs_t["policy"][:, (history - 1) * 29 : history * 29]
+                err = obs_t["goal"][:, :29] - q_obs
+                z, _ = update_integral(z, err, getattr(policy, "control_dt_s", 0.02), integral_cfg.get("tau_s", 2.0), integral_cfg.get("clip_abs", 0.5))
+                if done.any() and integral_cfg.get("reset_on_episode", True):
+                    z[done] = 0
             if done.any():
                 ids = done.nonzero().squeeze(-1)
                 for e in ids.tolist():

@@ -1,0 +1,12 @@
+name: integral_ablation
+output_root: runs
+seeds: [0]
+experiments:
+  - id: B0
+    cfg: ../experiments/baseline.yaml
+  - id: I1
+    cfg: ../experiments/integral_actor.yaml
+  - id: I2
+    cfg: ../experiments/integral_actor_critic.yaml
+  - id: I3
+    cfg: ../experiments/integral_detach.yaml

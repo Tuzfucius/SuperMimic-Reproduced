@@ -5,7 +5,11 @@
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
+from pathlib import Path
+
 
 # Under torchrun, pin each rank to its own GPU *before* CUDA/warp initialise: MuJoCo Warp and
 # mjlab's simulation always run on the first visible device, so cfg.device alone is not enough.
@@ -37,11 +41,38 @@ if "LOCAL_RANK" in os.environ and int(os.environ.get("LOCAL_WORLD_SIZE", "1")) <
 
 import tyro
 
-from supermimic.config import TrainConfig
+from supermimic.config import TrainConfig, resolve_config
+from supermimic.config_loader import config_dict, load_config
 
 
 def main() -> None:
-    cfg = tyro.cli(TrainConfig)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--cfg", type=Path)
+    parser.add_argument("--set", dest="overrides", action="append", default=[])
+    parser.add_argument("--dry-run", action="store_true")
+    known, remaining = parser.parse_known_args()
+    cfg = load_config(known.cfg, known.overrides)
+    if remaining:
+        # Tyro overlays explicit legacy flags on the resolved YAML object.
+        cfg = tyro.cli(TrainConfig, default=cfg, args=remaining)
+    cfg = resolve_config(cfg)
+    cfg._source_yaml = known.cfg.resolve() if known.cfg else None
+    if known.dry_run:
+        import yaml
+
+        print(yaml.safe_dump(config_dict(cfg), sort_keys=False))
+        print(json.dumps({
+            "dimensions": {
+                "policy_observation": cfg.policy.history * 93,
+                "goal": cfg.policy.goal_dim,
+                "integral": cfg.policy.integral_dim,
+                "actor_decoder_input": cfg.policy.latent_dim + cfg.policy.history * 93 + cfg.policy.integral_dim,
+                "critic_integral": cfg.critic.integral_dim,
+            },
+            "experiment_path": str(cfg.log_root / cfg.run_name),
+            "validation": "configuration structure only; no GPU or simulator initialized",
+        }, indent=2))
+        return
     from supermimic.training.loop import Trainer
 
     Trainer(cfg).run()

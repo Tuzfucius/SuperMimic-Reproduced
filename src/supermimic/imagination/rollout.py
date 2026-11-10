@@ -9,8 +9,14 @@ import torch
 from supermimic.data.replay_buffer import StartBatch
 from supermimic.envs.mdp.motion_library import MotionLibrary
 from supermimic.imagination.compiled import REWARD_TERM_NAMES, ImagStep
+from supermimic.policy.integral import update_integral
 from supermimic.policy.nets import Policy
-from supermimic.world_model.heads import ReferenceFrame, analytic_observation, anchor_relative_obs, flatten_history_term_major
+from supermimic.world_model.heads import (
+    ReferenceFrame,
+    analytic_observation,
+    anchor_relative_obs,
+    flatten_history_term_major,
+)
 from supermimic.world_model.wm_trainer import reference_at
 from supermimic.world_model.world_model import WorldModel
 
@@ -29,6 +35,8 @@ class ImagRollout:
     goals: torch.Tensor  # (H+1, n, 680)
     e_root: torch.Tensor  # (H+1, n, 4)
     frames: torch.Tensor  # (H+1, n)
+    integrals: torch.Tensor | None  # (H+1, n, 29), z_t aligned with state/action at t
+    joint_errors: torch.Tensor | None  # (H+1, n, 29), policy-visible ref-minus-observation error
     reward_terms: dict  # mean of each reward term over the rollout (diagnostics)
 
 
@@ -42,6 +50,13 @@ def imagine(
     obs_noise: bool = True,
     step_fn: ImagStep | None = None,
     anchor_obs: bool = False,
+    integral_enabled: bool = False,
+    integral_dim: int = 29,
+    integral_dt_s: float = 0.02,
+    integral_tau_s: float = 2.0,
+    integral_clip_abs: float = 0.5,
+    integral_gradient_mode: str = "full",
+    integral_actor_input: bool = True,
 ) -> ImagRollout:
     device = start.state.device
     n = start.state.shape[0]
@@ -70,9 +85,14 @@ def imagine(
     s = start.state
     frame = start.frame.clone()
     a_prev = start.prev_action
+    integral = start.integral if integral_enabled and start.integral is not None else (
+        torch.zeros(n, integral_dim, device=device) if integral_enabled else None
+    )
     c = torch.ones(n, device=device)
 
     states = [s]
+    integrals = [integral] if integral is not None else None
+    joint_errors = [torch.zeros(n, integral_dim, device=device)] if integral is not None else None
     actions, rewards = [], []
     dhats, survivals, frames = [torch.zeros(n, device=device)], [c], [frame]
     # All target frames of the rollout are known up front (frame + t, clamped at the clip end):
@@ -97,7 +117,14 @@ def imagine(
 
     for t in range(horizon):
         obs_flat = flatten_history_term_major(torch.stack(hist, 0))
-        a = policy(obs_flat, goals[-1])
+        a = policy(obs_flat, goals[-1], integral=integral if integral_actor_input else None)
+        if integral is not None:
+            # Match collection: action uses z_t, then the error from the same visible (o_t, g_t)
+            # advances memory to z_{t+1}. The newest observation is term-major frame hist[-1].
+            error = goals[-1][:, :integral_dim] - hist[-1][:, :integral_dim]
+            integral, _ = update_integral(integral, error, integral_dt_s, integral_tau_s, integral_clip_abs, integral_gradient_mode)
+            integrals.append(integral)
+            joint_errors.append(error)
         s_next, r, term_vec, logits, obs_clean, anchor_pose = step_fn(s, a, a_prev, start.xi, ref)
         d = torch.sigmoid(logits)
         c = c * (1.0 - d)
@@ -105,7 +132,8 @@ def imagine(
 
         frame = frames_all[t + 1]
         ref = ref_at(t + 1)
-        hist = hist[1:] + [add_noise(obs_clean)]
+        obs_new = add_noise(obs_clean)
+        hist = hist[1:] + [obs_new]
         a_prev = a
         s = s_next
         states.append(s)
@@ -113,7 +141,8 @@ def imagine(
         rewards.append(r)
         dhats.append(d)
         survivals.append(c)
-        goals.append(make_goal(frame, ref, anchor_pose))
+        next_goal = make_goal(frame, ref, anchor_pose)
+        goals.append(next_goal)
         e_roots.append(wm.heads.root_error_features(s, ref))
         frames.append(frame)
 
@@ -126,5 +155,7 @@ def imagine(
         goals=torch.stack(goals),
         e_root=torch.stack(e_roots),
         frames=torch.stack(frames),
+        integrals=torch.stack(integrals) if integrals is not None else None,
+        joint_errors=torch.stack(joint_errors) if joint_errors is not None else None,
         reward_terms={k: float(v / horizon) for k, v in zip(REWARD_TERM_NAMES, term_sum.tolist())},
     )

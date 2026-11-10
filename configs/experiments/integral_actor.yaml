@@ -1,0 +1,7 @@
+_base_: baseline.yaml
+run_name: I1
+integral:
+  enabled: true
+  actor_input: true
+  critic_input: false
+  gradient_mode: full

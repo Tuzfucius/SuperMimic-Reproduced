@@ -1,0 +1,5 @@
+_base_: ../default.yaml
+data:
+  library: data/library/bones_seed_compact.pt
+env:
+  compact_library: true
