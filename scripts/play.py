@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 from typing import Literal
 
-import torch
 import tyro
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
@@ -23,17 +22,7 @@ from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.eval.benchmark import load_policy_from_checkpoint
-
-
-class _DictPolicy:
-    """Adapts policy(obs_policy, obs_goal) to the viewer's policy(obs) protocol."""
-
-    def __init__(self, policy):
-        self.policy = policy
-
-    @torch.no_grad()
-    def __call__(self, obs):
-        return self.policy(obs["policy"], obs["goal"])
+from supermimic.policy.integral import IntegralPolicyRunner
 
 
 def main(
@@ -52,6 +41,7 @@ def main(
         npz_files=files,
         num_envs=num_envs,
         future_frames=cfg["env"]["future_frames"],
+        history_length=cfg["policy"].get("history", 10),
         episode_length_s=1.0e5,
         action_noise_std=0.0,
         obs_noise=False,
@@ -61,10 +51,22 @@ def main(
         record_transitions=False,
         seed=0,
         anchor_obs=cfg["env"].get("anchor_obs", False),
+        sim_timestep_s=cfg["env"].get("sim_timestep_s", 0.005),
+        decimation=cfg["env"].get("decimation", 4),
         debug_vis=ghost,
     )
-    env = RslRlVecEnvWrapper(make_env(args, device=device))
-    pol = _DictPolicy(policy)
+    base_env = make_env(args, device=device)
+    command = base_env.command_manager.get_term("motion")
+    env = RslRlVecEnvWrapper(base_env)
+    pol = IntegralPolicyRunner(policy, command)
+    reset_env = env.reset
+
+    def reset_with_integral(*args, **kwargs):
+        result = reset_env(*args, **kwargs)
+        pol.reset()
+        return result
+
+    env.reset = reset_with_integral
     if viewer == "auto":
         viewer = "native" if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) else "viser"
     print(f"[INFO] {len(files)} clip(s), {num_envs} env(s), viewer={viewer}")

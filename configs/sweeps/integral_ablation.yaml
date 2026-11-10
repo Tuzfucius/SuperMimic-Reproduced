@@ -1,0 +1,17 @@
+name: integral_ablation
+output_root: runs
+seeds: [0, 1, 2]
+evaluation:
+  enabled: true
+  dataset: data/npz/lafan1
+  num_envs: 256
+  checkpoint: latest
+experiments:
+  - id: B0
+    cfg: ../experiments/baseline.yaml
+  - id: I1
+    cfg: ../experiments/integral_actor.yaml
+  - id: I2
+    cfg: ../experiments/integral_actor_critic.yaml
+  - id: I3
+    cfg: ../experiments/integral_detach.yaml

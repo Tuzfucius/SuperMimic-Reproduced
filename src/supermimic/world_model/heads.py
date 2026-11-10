@@ -10,12 +10,15 @@ imagined rollouts.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
 from supermimic.envs.mdp.rewards import TrackingRewardCfg, tracking_reward_terms
-from supermimic.kinematics.g1_fk import G1Kinematics
 from supermimic.kinematics.rotations import projected_gravity, quat_apply_inverse
+
+if TYPE_CHECKING:
+    from supermimic.kinematics.g1_fk import G1Kinematics
 
 OBS_DIM = 93
 # Term layout of the ``policy`` observation group (order matters: term-major history).
@@ -146,7 +149,12 @@ class AnalyticHeads:
     def root_error_features(s: torch.Tensor, ref: ReferenceFrame) -> torch.Tensor:
         """Critic-only privileged drift features (plan D10): root position error in the reference
         heading frame (3) and yaw error (1). (N, 4)"""
-        from supermimic.kinematics.rotations import heading_yaw, quat_apply_inverse, wrap_to_pi, yaw_quat
+        from supermimic.kinematics.rotations import (
+            heading_yaw,
+            quat_apply_inverse,
+            wrap_to_pi,
+            yaw_quat,
+        )
 
         dp = quat_apply_inverse(yaw_quat(ref.root_quat_w), s[..., 0:3] - ref.root_pos_w)
         dyaw = wrap_to_pi(heading_yaw(s[..., 3:7]) - heading_yaw(ref.root_quat_w))

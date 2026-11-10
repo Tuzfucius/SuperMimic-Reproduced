@@ -1,0 +1,4 @@
+_base_: integral_actor.yaml
+run_name: I2
+integral:
+  critic_input: true

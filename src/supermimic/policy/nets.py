@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from supermimic.world_model.dynamics import MLP
 from supermimic.world_model.heads import OBS_TERMS
@@ -27,11 +27,13 @@ class PolicyCfg:
     goal_term_scale: tuple[float, ...] = (1.0, 5.0, 1.0, 2.0, 1.0, 1.0)
     decoder_last_gain: float = 0.01
     goal_dim: int = GOAL_DIM  # 680 (+9 with anchor_obs)
+    integral_dim: int = 0
 
 
 @dataclass
 class CriticCfg:
     hidden: tuple[int, ...] = (256, 128)
+    integral_dim: int = 0
 
 
 def _obs_scale_vector(cfg: PolicyCfg) -> torch.Tensor:
@@ -60,13 +62,20 @@ class MotionEncoder(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, cfg: PolicyCfg, obs_dim: int = 930):
+    def __init__(self, cfg: PolicyCfg):
         super().__init__()
-        self.mlp = MLP(cfg.latent_dim + obs_dim, cfg.decoder_hidden, ACT_DIM, last_gain=cfg.decoder_last_gain)
+        obs_dim = cfg.history * sum(dim for _, dim in OBS_TERMS)
+        self.integral_dim = cfg.integral_dim
+        self.mlp = MLP(cfg.latent_dim + obs_dim + cfg.integral_dim, cfg.decoder_hidden, ACT_DIM, last_gain=cfg.decoder_last_gain)
         self.register_buffer("scale", _obs_scale_vector(cfg))
 
-    def forward(self, z: torch.Tensor, obs_hist: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([z, obs_hist * self.scale], dim=-1))
+    def forward(self, z: torch.Tensor, obs_hist: torch.Tensor, integral: torch.Tensor | None = None) -> torch.Tensor:
+        parts = [z, obs_hist * self.scale]
+        if self.integral_dim:
+            if integral is None or integral.shape[-1] != self.integral_dim:
+                raise ValueError(f"policy requires integral input of dimension {self.integral_dim}")
+            parts.append(integral)
+        return self.mlp(torch.cat(parts, dim=-1))
 
 
 class Policy(nn.Module):
@@ -78,8 +87,8 @@ class Policy(nn.Module):
         self.encoders = nn.ModuleDict({"motion": MotionEncoder(cfg)})
         self.decoder = Decoder(cfg)
 
-    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, interface: str = "motion") -> torch.Tensor:
-        return self.decoder(self.encoders[interface](goal), obs_hist)
+    def forward(self, obs_hist: torch.Tensor, goal: torch.Tensor, interface: str = "motion", integral: torch.Tensor | None = None) -> torch.Tensor:
+        return self.decoder(self.encoders[interface](goal), obs_hist, integral)
 
 
 class Critic(nn.Module):
@@ -89,8 +98,14 @@ class Critic(nn.Module):
         super().__init__()
         pcfg = pcfg or PolicyCfg()
         goal_dim = goal_dim or pcfg.goal_dim
-        self.mlp = MLP(feat_dim + goal_dim + xi_dim + 4, cfg.hidden, 1)
+        self.integral_dim = cfg.integral_dim
+        self.mlp = MLP(feat_dim + goal_dim + xi_dim + 4 + cfg.integral_dim, cfg.hidden, 1)
         self.register_buffer("goal_scale", _goal_scale_vector(pcfg, goal_dim))
 
-    def forward(self, feat: torch.Tensor, goal: torch.Tensor, xi_norm: torch.Tensor, e_root: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([feat, goal * self.goal_scale, xi_norm, e_root], dim=-1)).squeeze(-1)
+    def forward(self, feat: torch.Tensor, goal: torch.Tensor, xi_norm: torch.Tensor, e_root: torch.Tensor, integral: torch.Tensor | None = None) -> torch.Tensor:
+        parts = [feat, goal * self.goal_scale, xi_norm, e_root]
+        if self.integral_dim:
+            if integral is None or integral.shape[-1] != self.integral_dim:
+                raise ValueError(f"critic requires integral input of dimension {self.integral_dim}")
+            parts.append(integral)
+        return self.mlp(torch.cat(parts, dim=-1)).squeeze(-1)

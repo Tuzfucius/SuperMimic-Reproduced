@@ -20,10 +20,12 @@ dependencies = [
   "pandas",
   "pyarrow",
   "tqdm",
+  "PyYAML>=6.0",
 ]
 
 [project.scripts]
 sm-train = "supermimic.scripts.train:main"
+sm-sweep = "supermimic.scripts.sweep:main"
 
 [dependency-groups]
 dev = [

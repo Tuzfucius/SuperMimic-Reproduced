@@ -46,6 +46,15 @@ def rank() -> int:
     return dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
 
+def broadcast_setup_error(error: str | None, src: int = 0) -> str | None:
+    """Broadcast rank-zero setup failure before any rank enters a barrier or training."""
+    if world_size() == 1:
+        return error
+    payload = [error if rank() == src else None]
+    dist.broadcast_object_list(payload, src=src)
+    return payload[0]
+
+
 @torch.no_grad()
 def allreduce_grads(module: torch.nn.Module) -> None:
     """Average gradients across ranks (flattened into one buffer per dtype)."""

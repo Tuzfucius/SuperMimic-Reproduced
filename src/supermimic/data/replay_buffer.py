@@ -34,18 +34,20 @@ class StartBatch:
     prev_action: torch.Tensor  # (n, A) clean action of the previous step (0 at episode start)
     hist_states: torch.Tensor  # (hist, n, S) states s_{t-hist+1..t} (backfilled at episode start)
     hist_actions: torch.Tensor  # (hist, n, A) clean actions a_{t-hist..t-1} aligned with hist_states' obs
+    integral: torch.Tensor | None = None  # z_t corresponding to state/frame/action at the sampled start
 
 
 class ReplayBuffer:
-    def __init__(self, num_envs: int, capacity: int, state_dim: int, act_dim: int, xi_dim: int, device):
+    def __init__(self, num_envs: int, capacity: int, state_dim: int, act_dim: int, xi_dim: int, device, integral_dim: int = 0):
         self.E, self.T = num_envs, capacity
         self.device = torch.device(device)
         E, T = num_envs, capacity
-        f = lambda *shape: torch.zeros(E, T, *shape, device=self.device)  # noqa: E731
+        f = lambda *shape: torch.zeros(E, T, *shape, device=self.device)
         self.s = f(state_dim)
         self.a = f(act_dim)
         self.a_exec = f(act_dim)
         self.xi = f(xi_dim)
+        self.integral = f(integral_dim) if integral_dim > 0 else None
         self.r = f()
         self.done = f()
         self.frame = torch.zeros(E, T, dtype=torch.long, device=self.device)
@@ -62,12 +64,16 @@ class ReplayBuffer:
     # ------------------------------------------------------------------ writes
 
     @torch.no_grad()
-    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start) -> None:
+    def add(self, env_ids, s, a, a_exec, xi, r, done, frame, clip, terminal, ep_start, integral=None) -> None:
         p = self.ptr[env_ids]
         self.s[env_ids, p] = s
         self.a[env_ids, p] = a
         self.a_exec[env_ids, p] = a_exec
         self.xi[env_ids, p] = xi
+        if self.integral is not None:
+            if integral is None:
+                raise ValueError("integral state is required by this replay buffer")
+            self.integral[env_ids, p] = integral
         self.r[env_ids, p] = r
         self.done[env_ids, p] = done
         self.frame[env_ids, p] = frame
@@ -86,6 +92,11 @@ class ReplayBuffer:
     @property
     def size(self) -> int:
         return int(self.valid.sum().item())
+
+    @torch.no_grad()
+    def has_sampleable_windows(self, k: int) -> bool:
+        """Whether current replay contents include at least one legal k-step window."""
+        return bool(self.window_mask(k).any().item())
 
     # ------------------------------------------------------------------ sampling helpers
 
@@ -112,17 +123,22 @@ class ReplayBuffer:
         return ok
 
     @torch.no_grad()
-    def _sample_from_mask(self, mask: torch.Tensor, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sample_from_mask(
+        self, mask: torch.Tensor, n: int, sample_kind: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         flat = mask.reshape(-1)
         total = int(flat.sum().item())
         if total == 0:
-            raise RuntimeError("replay buffer has no sampleable rows yet")
+            raise RuntimeError(
+                f"ReplayBuffer has no sampleable {sample_kind}; collect more data and check "
+                "warmup, Episode lengths, and replay capacity"
+            )
         idx = torch.multinomial(flat.float(), n, replacement=True)
         return idx // self.T, idx % self.T
 
     @torch.no_grad()
     def sample_windows(self, n: int, k: int) -> WindowBatch:
-        e, t = self._sample_from_mask(self.window_mask(k), n)
+        e, t = self._sample_from_mask(self.window_mask(k), n, f"{k}-step windows")
         offs = torch.arange(k + 1, device=self.device)
         tt = (t[None, :] + offs[:, None]) % self.T  # (k+1, n)
         ee = e[None, :].expand(k + 1, n)
@@ -142,7 +158,7 @@ class ReplayBuffer:
         t_idx = torch.arange(self.T, device=self.device)[None, :]
         dist_to_ptr = (self.ptr[:, None] - t_idx - 1) % self.T
         mask &= dist_to_ptr < self.T - hist - 1  # keep history rows from being overwritten underneath
-        e, t = self._sample_from_mask(mask, n)
+        e, t = self._sample_from_mask(mask, n, f"starts with history={hist}")
         offs = torch.arange(hist, device=self.device) - (hist - 1)  # -(hist-1) .. 0
         tt = (t[None, :] + offs[:, None]) % self.T  # (hist, n)
         ee = e[None, :].expand(hist, n)
@@ -164,4 +180,5 @@ class ReplayBuffer:
             prev_action=hist_actions[-1],
             hist_states=hist_states,
             hist_actions=hist_actions,
+            integral=None if self.integral is None else self.integral[e, t],
         )

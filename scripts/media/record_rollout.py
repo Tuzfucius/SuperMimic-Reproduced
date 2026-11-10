@@ -20,6 +20,7 @@ from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.envs.state_io import NQ, StateIO
 from supermimic.eval.benchmark import load_policy_from_checkpoint
+from supermimic.policy.integral import IntegralPolicyRunner
 
 
 @torch.no_grad()
@@ -31,12 +32,16 @@ def main(ckpt: Path, clips: list[str], npz_dir: Path = Path("data/npz/bones_seed
     n = len(files)
     args = SuperMimicEnvCfgArgs(
         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
+        history_length=cfg["policy"].get("history", 10),
         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start",
         record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False),
+        sim_timestep_s=cfg["env"].get("sim_timestep_s", 0.005),
+        decimation=cfg["env"].get("decimation", 4),
     )
     env = make_env(args, device=device)
     try:
         cmd = env.command_manager.get_term("motion")
+        policy_runner = IntegralPolicyRunner(policy, cmd)
         lib = cmd.library
         io = StateIO(env)
         env_clip = torch.arange(n, device=device)
@@ -55,12 +60,14 @@ def main(ckpt: Path, clips: list[str], npz_dir: Path = Path("data/npz/bones_seed
 
         snapshot()
         while alive.any():
-            act = policy(obs["policy"], obs["goal"])
+            act = policy_runner(obs)
             obs, rew, term, tout, _ = env.step(act)
             rew_sum += rew * alive
             steps += alive.long()
             done = (term | tout) & alive
             alive &= ~done
+            if done.any():
+                policy_runner.reset(done.nonzero().squeeze(-1))
             if alive.any():
                 snapshot()
             if steps.max() > 20000:
