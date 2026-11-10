@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = "==3.12.*"
 resolution-markers = [
     "sys_platform == 'win32'",
@@ -1899,6 +1899,7 @@ dependencies = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "pyarrow" },
+    { name = "pyyaml" },
     { name = "scipy" },
     { name = "tensorboard" },
     { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform == 'darwin'" },
@@ -1925,6 +1926,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "pandas" },
     { name = "pyarrow" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "scipy", specifier = ">=1.15" },
     { name = "tensorboard", specifier = ">=2.20.0" },
     { name = "torch", marker = "sys_platform != 'darwin'", specifier = ">=2.14.0", index = "https://download.pytorch.org/whl/cu130" },

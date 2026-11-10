@@ -23,6 +23,7 @@ from mjlab.utils.lab_api.math import quat_apply, quat_inv, quat_mul, wrap_to_pi,
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.envs.mdp.motion_library import discover_npz
 from supermimic.eval.benchmark import load_policy_from_checkpoint
+from supermimic.policy.integral import IntegralPolicyRunner
 
 
 def _yaw(q: torch.Tensor) -> torch.Tensor:
@@ -39,10 +40,13 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
         npz_files=files, num_envs=n, future_frames=cfg["env"]["future_frames"], episode_length_s=1.0e5,
         action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False,
         sampling_mode="start", record_transitions=False, seed=0, anchor_obs=cfg["env"].get("anchor_obs", False),
+        sim_timestep_s=cfg["env"].get("sim_timestep_s", 0.005),
+        decimation=cfg["env"].get("decimation", 4),
     )
     env = make_env(args, device=device)
     try:
         cmd = env.command_manager.get_term("motion")
+        policy_runner = IntegralPolicyRunner(policy, cmd)
         lib = cmd.library
         cmd.forced_frame[:] = lib.clip_start[torch.arange(n, device=device)]
         obs, _ = env.reset()
@@ -89,7 +93,7 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
             sum_w_world += ew_w * a
             sum_w_aligned += ew_a * a
             steps += a
-            act = policy(obs["policy"], obs["goal"])
+            act = policy_runner(obs)
             obs, _, term, tout, _ = env.step(act)
             done = (term | tout) & active
             failed |= term & active
@@ -97,23 +101,23 @@ def main(ckpt: Path, npz_dir: Path = Path("data/npz/lafan1"), clips: list[str] |
         st = steps.clamp(min=1)
         rows = []
         for i in range(n):
-            rows.append(dict(
-                name=lib.clips[i].name, steps=int(steps[i]), failed=bool(failed[i]),
-                mean_xy=float(sum_xy[i] / st[i]), final_xy=float(last_xy[i]),
-                mean_yaw_deg=math.degrees(float(sum_yaw[i] / st[i])), final_yaw_deg=math.degrees(float(last_yaw[i])),
-                t_xy_gt_0p3=float(t_xy[i]), t_yaw_gt_15=float(t_yaw[i]),
-                r_lin_world=float(torch.exp(-sum_v_world[i] / st[i] / 1.0)), r_lin_aligned=float(torch.exp(-sum_v_aligned[i] / st[i] / 1.0)),
-                r_ang_world=float(torch.exp(-sum_w_world[i] / st[i] / 3.14**2)), r_ang_aligned=float(torch.exp(-sum_w_aligned[i] / st[i] / 3.14**2)),
-            ))
+            rows.append({
+                "name": lib.clips[i].name, "steps": int(steps[i]), "failed": bool(failed[i]),
+                "mean_xy": float(sum_xy[i] / st[i]), "final_xy": float(last_xy[i]),
+                "mean_yaw_deg": math.degrees(float(sum_yaw[i] / st[i])), "final_yaw_deg": math.degrees(float(last_yaw[i])),
+                "t_xy_gt_0p3": float(t_xy[i]), "t_yaw_gt_15": float(t_yaw[i]),
+                "r_lin_world": float(torch.exp(-sum_v_world[i] / st[i] / 1.0)), "r_lin_aligned": float(torch.exp(-sum_v_aligned[i] / st[i] / 1.0)),
+                "r_ang_world": float(torch.exp(-sum_w_world[i] / st[i] / 3.14**2)), "r_ang_aligned": float(torch.exp(-sum_w_aligned[i] / st[i] / 3.14**2)),
+            })
         tot = steps.sum()
-        agg = dict(
-            clips=n, failed=int(failed.sum()),
-            mean_xy=float((sum_xy).sum() / tot), mean_yaw_deg=math.degrees(float(sum_yaw.sum() / tot)),
-            median_t_xy_gt_0p3=float(torch.median(t_xy[t_xy >= 0])) if (t_xy >= 0).any() else -1,
-            median_t_yaw_gt_15=float(torch.median(t_yaw[t_yaw >= 0])) if (t_yaw >= 0).any() else -1,
-            lin_vel_reward_world=float(torch.exp(-sum_v_world.sum() / tot)), lin_vel_reward_yaw_aligned=float(torch.exp(-sum_v_aligned.sum() / tot)),
-            ang_vel_reward_world=float(torch.exp(-sum_w_world.sum() / tot / 3.14**2)), ang_vel_reward_yaw_aligned=float(torch.exp(-sum_w_aligned.sum() / tot / 3.14**2)),
-        )
+        agg = {
+            "clips": n, "failed": int(failed.sum()),
+            "mean_xy": float((sum_xy).sum() / tot), "mean_yaw_deg": math.degrees(float(sum_yaw.sum() / tot)),
+            "median_t_xy_gt_0p3": float(torch.median(t_xy[t_xy >= 0])) if (t_xy >= 0).any() else -1,
+            "median_t_yaw_gt_15": float(torch.median(t_yaw[t_yaw >= 0])) if (t_yaw >= 0).any() else -1,
+            "lin_vel_reward_world": float(torch.exp(-sum_v_world.sum() / tot)), "lin_vel_reward_yaw_aligned": float(torch.exp(-sum_v_aligned.sum() / tot)),
+            "ang_vel_reward_world": float(torch.exp(-sum_w_world.sum() / tot / 3.14**2)), "ang_vel_reward_yaw_aligned": float(torch.exp(-sum_w_aligned.sum() / tot / 3.14**2)),
+        }
         print(json.dumps(agg, indent=1))
         print(f"{'clip':30s} {'steps':>6s} {'fail':>4s} {'xy_mean':>7s} {'xy_end':>6s} {'yaw_mean':>8s} {'yaw_end':>7s} {'t>0.3m':>7s} {'t>15deg':>7s} {'rlin_w':>6s} {'rlin_a':>6s}")
         for r in rows:

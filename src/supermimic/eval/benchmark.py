@@ -16,7 +16,7 @@ from pathlib import Path
 import torch
 
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
-from supermimic.policy.integral import update_integral
+from supermimic.policy.integral import IntegralPolicyRunner
 from supermimic.policy.nets import Policy, PolicyCfg
 
 
@@ -38,13 +38,18 @@ def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, 
     policy = Policy(pcfg).to(device)
     policy.load_state_dict(ck["policy"])
     policy.integral_options = ck["config"].get("integral", {"enabled": False})
-    policy.control_dt_s = ck["config"].get("env", {}).get("sim_timestep_s", 0.005) * ck["config"].get("env", {}).get("decimation", 4)
+    env_cfg = ck["config"].get("env", {})
+    policy.control_dt_s = env_cfg.get("sim_timestep_s", 0.005) * env_cfg.get("decimation", 4)
+    if abs(policy.control_dt_s - 0.02) > 1e-9:
+        raise ValueError(f"checkpoint control interval {policy.control_dt_s:g}s is incompatible with 50Hz motion data")
     policy.eval()
     return policy, ck["config"]
 
 
 @torch.no_grad()
-def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, anchor_obs: bool = False) -> list[ClipResult]:
+def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, anchor_obs: bool = False, sim_timestep_s: float = 0.005, decimation: int = 4) -> list[ClipResult]:
+    if abs(sim_timestep_s * decimation - 0.02) > 1e-9:
+        raise ValueError("benchmark requires a 0.02s (50Hz) control interval to match the motion library")
     num_envs = min(num_envs or 1024, len(npz_files))
     args = SuperMimicEnvCfgArgs(
         npz_files=npz_files,
@@ -59,6 +64,8 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         record_transitions=False,
         seed=0,
         anchor_obs=anchor_obs,
+        sim_timestep_s=sim_timestep_s,
+        decimation=decimation,
     )
     env = make_env(args, device=device)
     try:
@@ -78,25 +85,17 @@ def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", 
         steps = torch.zeros(num_envs, dtype=torch.long, device=device)
         term_names = list(env.reward_manager.active_terms)
         term_sum = torch.zeros(num_envs, len(term_names), device=device)
-        integral_cfg = getattr(policy, "integral_options", {"enabled": False})
-        z = torch.zeros(num_envs, 29, device=device) if integral_cfg.get("enabled", False) else None
+        policy_runner = IntegralPolicyRunner(policy, cmd)
         results: dict[int, ClipResult] = {}
         remaining = n_clips
         while remaining > 0:
             obs_t = obs
-            act = policy(obs_t["policy"], obs_t["goal"], integral=z if z is not None and integral_cfg.get("actor_input", True) else None)
+            act = policy_runner(obs_t)
             obs, rew, term, tout, _ = env.step(act)
             ret_sum += rew
             term_sum += env.reward_manager.term_rewards
             steps += 1
             done = (term | tout) & active
-            if z is not None:
-                history = policy.cfg.history
-                q_obs = obs_t["policy"][:, (history - 1) * 29 : history * 29]
-                err = obs_t["goal"][:, :29] - q_obs
-                z, _ = update_integral(z, err, getattr(policy, "control_dt_s", 0.02), integral_cfg.get("tau_s", 2.0), integral_cfg.get("clip_abs", 0.5))
-                if done.any() and integral_cfg.get("reset_on_episode", True):
-                    z[done] = 0
             if done.any():
                 ids = done.nonzero().squeeze(-1)
                 for e in ids.tolist():

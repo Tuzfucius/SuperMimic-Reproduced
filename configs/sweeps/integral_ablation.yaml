@@ -1,6 +1,11 @@
 name: integral_ablation
 output_root: runs
-seeds: [0]
+seeds: [0, 1, 2]
+evaluation:
+  enabled: true
+  dataset: data/npz/lafan1
+  num_envs: 256
+  checkpoint: latest
 experiments:
   - id: B0
     cfg: ../experiments/baseline.yaml

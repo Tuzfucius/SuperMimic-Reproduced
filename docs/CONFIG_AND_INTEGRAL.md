@@ -16,14 +16,16 @@ uv run sm-train --cfg configs/experiments/integral_actor.yaml --dry-run
 ```
 
 Dry run validates configuration and reports dimensions and the output path. It does not validate
-GPU availability, MuJoCo Warp initialization, model compilation, or a training step. The control
-interval is derived from `env.sim_timestep_s * env.decimation` and is also used for the explicit
-world-model integrator. Policy history and future-frame dimensions are propagated from their
-single environment/policy sources.
+GPU availability, MuJoCo Warp initialization, model compilation, or a training step. Motion data
+is currently fixed at 50 Hz, so configuration rejects any `env.sim_timestep_s * env.decimation`
+other than 0.02 s. That control interval also drives the world-model and integral updates. Policy
+history and future-frame dimensions are propagated from their single environment/policy sources.
 
 Use `sm-sweep` for sequential runs. `--gpu 0` sets `CUDA_VISIBLE_DEVICES`; `--dry-run` prints the
-matrix without training. A completed run is skipped by its metadata state. Failed runs are written
-to the sweep summary and do not stop later experiments.
+matrix without training or evaluation. With `evaluation.enabled: true`, the existing benchmark is
+run after successful training and writes `benchmark.json` plus `eval_metrics.json`. Completed
+training without a successful benchmark can be evaluated again without retraining. Results include
+benchmark returns and failure rates, with mean and standard deviation across seeds.
 
 ## Integral state
 
@@ -50,11 +52,14 @@ mechanism does not imply that those errors are corrected.
 ## Run state and recovery
 
 Run directories are collision checked and contain source/resolved YAML, metadata, TensorBoard logs,
-metrics, and checkpoints. `resume` restores model, optimizers, and sampler statistics and restores
-the integral configuration from the checkpoint. The simulator state and replay buffer are not
-checkpointed: resumed training restarts the environment and buffer, so it is not step-for-step
-continuation. `init_from` loads model weights into a fresh experiment without loading optimizer or
-iteration state.
+metrics, and checkpoints. `resume` reopens the checkpoint's original run directory and validates
+the requested training configuration against the checkpoint; semantic conflicts are rejected
+instead of being silently replaced. It restores model, optimizers, iteration and update counters,
+the update-to-data accumulator, and sampler statistics. Logging cadence and training limits may be
+changed. The simulator state and replay buffer are not checkpointed: resumed training repeats
+Replay Warmup with a fresh environment and buffer, so this is not step-for-step continuation.
+`init_from` loads model weights into a fresh experiment without loading optimizer or iteration state.
+`resume` and `init_from` cannot be combined.
 
 Benchmark evaluation restores integral settings from the checkpoint. The interactive play adapter
 updates from consecutive policy observations and detects episode resets from the motion command's

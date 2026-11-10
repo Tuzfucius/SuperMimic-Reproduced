@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from supermimic.config_loader import config_dict, load_config
@@ -44,3 +46,49 @@ def test_path_tuple_optional_and_boolean_conversion(tmp_path):
     assert cfg.policy.decoder_hidden == (16, 8)
     assert cfg.env.obs_noise is False
     assert cfg.data.limit is None
+
+
+def test_derived_dimensions_schedule_fields_and_control_rate_guard(tmp_path):
+    p = tmp_path / "derived.yaml"
+    p.write_text(
+        "policy:\n  history: 8\nenv:\n  future_frames: 12\n"
+        "schedule:\n  total_iterations: 100\n  max_hours: 1.5\n"
+        "integral:\n  enabled: true\n  actor_input: false\n  critic_input: true\n"
+    )
+    cfg = load_config(p)
+    assert cfg.policy.history == cfg.policy_trainer.history == 8
+    assert cfg.policy.goal_dim == cfg.env.future_frames * 68
+    assert cfg.policy_trainer.future_frames == 12
+    assert cfg.policy.integral_dim == 0 and cfg.critic.integral_dim == 29
+    assert cfg.schedule.total_iterations == 100 and cfg.schedule.max_hours == 1.5
+
+    p.write_text("env:\n  sim_timestep_s: 0.01\n  decimation: 4\n")
+    with pytest.raises(ValueError, match="50 Hz"):
+        load_config(p)
+
+
+def test_resume_and_init_from_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        load_config(overrides=["resume=old.pt", "init_from=old.pt"])
+
+
+def test_train_dry_run_applies_yaml_set_then_legacy_cli_without_trainer(tmp_path, monkeypatch, capsys):
+    from supermimic.scripts.train import main
+
+    cfg = tmp_path / "exp.yaml"
+    cfg.write_text("run_name: yaml_name\nintegral:\n  enabled: true\n")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "sm-train", "--cfg", str(cfg), "--set", "seed=2", "--run-name", "legacy_name",
+            "--env.num-envs", "16", "--dry-run",
+        ],
+    )
+    main()
+    output = capsys.readouterr().out
+    assert "run_name: legacy_name" in output
+    assert "seed: 2" in output
+    assert "num_envs: 16" in output
+    assert '"integral": 29' in output
+    assert '"validation": "configuration structure only; no GPU or simulator initialized"' in output

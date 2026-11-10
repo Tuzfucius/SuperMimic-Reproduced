@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -92,6 +93,13 @@ def resolve_config(cfg: TrainConfig) -> TrainConfig:
         raise ValueError("env.future_frames must be >= 1")
     if cfg.env.decimation < 1 or cfg.env.sim_timestep_s <= 0:
         raise ValueError("env.decimation and env.sim_timestep_s must be positive")
+    if abs(cfg.env.control_dt_s - 0.02) > 1e-9:
+        raise ValueError(
+            "the motion library is sampled at 50 Hz; env.sim_timestep_s * env.decimation "
+            f"must equal 0.02 s, got {cfg.env.control_dt_s:g} s"
+        )
+    if cfg.resume is not None and cfg.init_from is not None:
+        raise ValueError("resume and init_from are mutually exclusive")
     # The simulator's composed control interval is the authority for both the
     # explicit world-model integrator and the error-memory recurrence.
     cfg.world_model.state_spec.dt = cfg.env.control_dt_s
@@ -111,6 +119,10 @@ def resolve_config(cfg: TrainConfig) -> TrainConfig:
         raise ValueError("integral.clip_abs must be > 0")
     if integral.gradient_mode not in {"full", "detach"}:
         raise ValueError("integral.gradient_mode must be 'full' or 'detach'")
+    if integral.enabled and not integral.actor_input and not integral.critic_input:
+        warnings.warn("integral.enabled is true but neither Actor nor Critic consumes the state", stacklevel=2)
+    if integral.enabled and not integral.reset_on_episode:
+        warnings.warn("integral state intentionally carries across Episode boundaries", stacklevel=2)
     cfg.policy.integral_dim = integral.dimension if integral.enabled and integral.actor_input else 0
     cfg.critic.integral_dim = integral.dimension if integral.enabled and integral.critic_input else 0
     cfg.policy_trainer.anchor_obs = cfg.env.anchor_obs

@@ -17,10 +17,17 @@ import numpy as np
 import torch
 import tyro
 
+from supermimic.policy.integral import IntegralPolicyRunner
+
 
 def make_tpose_clip(out: Path, seconds: float = 20.0, fps: int = 50) -> Path:
     """Write a 50 Hz T-pose npz (standing still) via the converter's FK."""
-    from supermimic.data.motion_convert import G1_JOINT_NAMES, forward_kinematics, load_g1_model, ResampledMotion
+    from supermimic.data.motion_convert import (
+        G1_JOINT_NAMES,
+        ResampledMotion,
+        forward_kinematics,
+        load_g1_model,
+    )
 
     T = int(seconds * fps)
     q = np.zeros((T, len(G1_JOINT_NAMES)))
@@ -62,10 +69,18 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
     tmp = Path(tempfile.mkdtemp()) / "tpose.npz"
     make_tpose_clip(tmp)
-    args = SuperMimicEnvCfgArgs(npz_files=[str(tmp)], num_envs=num_envs, action_noise_std=0.0, obs_noise=False, reset_noise=False, domain_randomization=False, sampling_mode="start", record_transitions=False, episode_length_s=1e5, future_frames=cfg["env"]["future_frames"], anchor_obs=cfg["env"].get("anchor_obs", False), seed=0)
+    args = SuperMimicEnvCfgArgs(
+        npz_files=[str(tmp)], num_envs=num_envs, action_noise_std=0.0, obs_noise=False,
+        reset_noise=False, domain_randomization=False, sampling_mode="start",
+        record_transitions=False, episode_length_s=1e5,
+        future_frames=cfg["env"]["future_frames"], anchor_obs=cfg["env"].get("anchor_obs", False),
+        sim_timestep_s=cfg["env"].get("sim_timestep_s", 0.005),
+        decimation=cfg["env"].get("decimation", 4), seed=0,
+    )
     env = make_env(args, device=device)
     robot = env.scene["robot"]
     cmd = env.command_manager.get_term("motion")
+    policy_runner = IntegralPolicyRunner(policy, cmd)
     dt = env.step_dt
     for speed in speeds:
         obs, _ = env.reset()
@@ -81,8 +96,8 @@ def main(ckpt: Path, speeds: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0), num_envs:
                 v[:, 1] += speed * torch.sin(ang)
                 robot.write_root_link_velocity_to_sim(v)
                 pushed = True
-            act = policy(obs["policy"], obs["goal"])
-            obs, rew, term, tout, _ = env.step(act)
+            act = policy_runner(obs)
+            obs, _, term, _, _ = env.step(act)
             fallen |= term
             if pushed:
                 err = torch.norm(cmd.root_pos_w - cmd.robot_root_pos_w, dim=-1)
