@@ -88,7 +88,6 @@ class Trainer:
 
         if cfg.data.library is not None:
             files = [cfg.data.library]
-            cfg.env.compact_library = True
         else:
             files = discover_npz(cfg.data.npz_dir, limit=cfg.data.limit, names=cfg.data.clips, manifest=cfg.data.manifest)
         if not files:

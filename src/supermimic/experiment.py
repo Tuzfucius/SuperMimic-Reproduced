@@ -14,7 +14,7 @@ from typing import Any
 import torch
 import yaml
 
-from supermimic.config import TrainConfig
+from supermimic.config import TrainConfig, resolve_config
 from supermimic.config_loader import config_dict
 
 
@@ -99,9 +99,14 @@ def _flatten(mapping: dict, prefix: str = "") -> dict[str, Any]:
 
 def validate_resume_config(cfg: TrainConfig, saved_config: dict) -> None:
     """Reject semantic drift while allowing logging limits and output location to change."""
-    defaults = _normalize(config_dict(TrainConfig()))
+    defaults = _normalize(config_dict(resolve_config(TrainConfig())))
     current = _normalize(config_dict(cfg))
-    saved = _merge_defaults(defaults, _normalize(saved_config))
+    stored = _normalize(saved_config)
+    saved = _merge_defaults(defaults, stored)
+    # Checkpoints written before compact-library mode was resolved in config loading
+    # only have an unambiguous mode when their data source says so.
+    if "compact_library" not in stored.get("env", {}) and saved.get("data", {}).get("library"):
+        saved["env"]["compact_library"] = True
     current_flat, saved_flat = _flatten(current), _flatten(saved)
     allowed = {
         "run_name", "log_root", "resume", "init_from", "device",

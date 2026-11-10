@@ -32,7 +32,9 @@ class EnvCfg:
     sampling_mode: str = "return"
     replay_capacity: int = 1000
     future_frames: int = 10
-    compact_library: bool = False
+    # None lets resolve_config derive the mode from data.library while preserving
+    # an explicit false/true as a checked user choice.
+    compact_library: bool | None = None
     anchor_obs: bool = False
     sim_timestep_s: float = 0.005
     decimation: int = 4
@@ -100,6 +102,11 @@ def resolve_config(cfg: TrainConfig) -> TrainConfig:
         )
     if cfg.resume is not None and cfg.init_from is not None:
         raise ValueError("resume and init_from are mutually exclusive")
+    if cfg.data.library is not None and cfg.env.compact_library is False:
+        raise ValueError("data.library requires env.compact_library=true; remove the explicit false")
+    if cfg.data.library is None and cfg.env.compact_library is True:
+        raise ValueError("env.compact_library=true requires data.library")
+    cfg.env.compact_library = cfg.data.library is not None
     # The simulator's composed control interval is the authority for both the
     # explicit world-model integrator and the error-memory recurrence.
     cfg.world_model.state_spec.dt = cfg.env.control_dt_s
